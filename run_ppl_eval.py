@@ -11,7 +11,7 @@ from loguru import logger
 def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
     if "wikitext2" in name:
         testdata = load_dataset(
-            "wikitext",
+            "Salesforce/wikitext",
             "wikitext-2-raw-v1",
             split="test",
         )
@@ -40,7 +40,7 @@ def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
 def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
     if "wikitext2" in name:
         testdata = load_dataset(
-            "wikitext",
+            "Salesforce/wikitext",
             "wikitext-2-raw-v1",
             split="test",
         )
