@@ -70,6 +70,8 @@ class PaluLlamaConfig(PretrainedConfig):
             experimental feature, subject to breaking API changes in future versions.
         attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
             Whether to use a bias in the query, key, value and output projection layers during self-attention.
+        mlp_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
+            Whether to use a bias in the MLP layers.
 
 
     ```python
@@ -108,6 +110,7 @@ class PaluLlamaConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         attention_bias=False,
+        mlp_bias=False,
         head_wise_ranks=None,
         **kwargs,
     ):
@@ -132,6 +135,7 @@ class PaluLlamaConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
+        self.mlp_bias = mlp_bias
 
         super().__init__(
             pad_token_id=pad_token_id,

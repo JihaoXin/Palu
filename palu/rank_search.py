@@ -104,7 +104,7 @@ def rank_search(model: nn.Module, tokenizer, args):
         return select_result, rank_sum, total_rank    
     elif args.search_method == "fisher":
         # Prepare Fisher information
-        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen)
+        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 32, seqlen=args.calib_seqlen)
         calib_fisher_info(model, calib_loader, torch.device(args.device), args.use_cache)
         
         
@@ -168,7 +168,7 @@ def rank_search(model: nn.Module, tokenizer, args):
         return select_result, rank_sum, total_rank    
     elif args.search_method == "fisher_uniform":
         # Prepare Fisher information
-        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen)
+        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 32, seqlen=args.calib_seqlen)
         calib_fisher_info(model, calib_loader, torch.device(args.device), args.use_cache)
         
         target_model_class = AVAILABLE_MODELS[model.config.model_type]["ModelForCausalLM"]

@@ -68,7 +68,7 @@ With the compressed model dumped, we can evaluate the performance of the compres
 To evaluate the perplexity of the compressed model on the `wikitext2` dataset with sequence length 2048, we can use the `ppl_eval.py` script.
 ```bash
 python run_ppl_eval.py \
---model_name_or_path /Path/To/Palu/Model \
+--model_name_or_path meta-llama/Meta-Llama-3-8B-Instruct \
 --datasets wikitext2 \
 --seqlen 2048
 ```
