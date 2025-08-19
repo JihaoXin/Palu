@@ -136,7 +136,19 @@ def get_whiten_scale_matrix(model, tokenizer, args, dev):
             subset[name].scaling_diag_matrix = 0
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks, position_ids=position_ids[0].unsqueeze(0))[0]
+            # Compute position_embeddings for transformers 4.49.0 compatibility
+            # Get the rotary embedding from the model
+            rotary_emb = model.model.rotary_emb
+            hidden_states = inps[j].unsqueeze(0)
+            position_ids_batch = position_ids[0].unsqueeze(0)
+            position_embeddings = rotary_emb(hidden_states, position_ids_batch)
+            
+            outs[j] = layer(
+                hidden_states, 
+                attention_mask=attention_masks, 
+                position_ids=position_ids_batch,
+                position_embeddings=position_embeddings
+            )[0]
         for h in handles:
             h.remove()
         layer = layer.cpu()
