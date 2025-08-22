@@ -238,37 +238,35 @@ def compress_model_whiten(model, tokenizer, args, dev, selection_result):
         setattr(info["father"], info["name"],  head_wise_svd_linear)
 
 def compress_model_svd(model, selection_result):
-    logger.info("Compressing model with svd decomposition...")
-    # Compress the model
-    module_dict = {name: module for name, module in model.named_modules()}
-    full_name_dict = {module: name for name, module in model.named_modules()}
-    linear_info = {}
-    modules = [model]
-    while len(modules) > 0:
-        submodule = modules.pop()
-        for name, raw_linear in submodule.named_children():
-            if isinstance(raw_linear, nn.Linear):
-                full_name = full_name_dict[raw_linear]
-                linear_info[raw_linear] = {
-                    "father": submodule,
-                    "name": name,
-                    "full_name": full_name,
-                }
-            else:
-                modules.append(raw_linear)
-
     logger.info(f"Start decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
     for layername, selected_head_rank in tqdm(selection_result.items()):
         logger.debug(f"Decompose {layername} with ranks: {selected_head_rank}")
-        # set ratio
-        raw_linear = module_dict[layername]
-        info = linear_info[raw_linear]
+        
+        # Parse the full path: e.g., "model.layers.0.self_attn.k_proj"
+        path_parts = layername.split('.')
+        parent_path = path_parts[:-1]  # ["model", "layers", "0", "self_attn"]  
+        child_name = path_parts[-1]    # "k_proj"
+        
+        # Navigate to the parent module step by step
+        parent_module = model
+        for attr in parent_path:
+            if attr.isdigit():  # Handle numeric indices like layers[0]
+                parent_module = parent_module[int(attr)]
+            else:
+                parent_module = getattr(parent_module, attr)
+        
+        # Get the Linear module to be replaced
+        raw_linear = getattr(parent_module, child_name)
+        
         print("head-wise svd", layername, raw_linear)
+        
+        # Create compressed version
         head_wise_svd_linear = HeadwiseLowRankModule.from_linear(
-            raw_linear,
-            selected_head_rank
+            raw_linear, selected_head_rank
         )
-        setattr(info["father"], info["name"],  head_wise_svd_linear)
+        
+        # Replace the module directly
+        setattr(parent_module, child_name, head_wise_svd_linear)
 
 # Wrapper for different decompose methods
 def compress_model(model, tokenizer, args, dev, selection_result):
