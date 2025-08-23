@@ -281,16 +281,9 @@ def compress_model_rope_svd(model, tokenizer, args, dev, selection_result):
     """
     logger.info("[rope_svd] Converting LlamaAttention -> LlamaPaluAttention (no_fusion, rope_in_latent)")
 
-    # Setup group parameters on config for readability; do not rely on uniform ranks.
-    group_size = getattr(args, "head_group_size", None)
-    if group_size is None:
-        raise ValueError("head_group_size is required for rope_svd")
-    num_kv_heads = model.config.num_key_value_heads
-    if num_kv_heads % group_size != 0:
-        raise ValueError(f"num_key_value_heads {num_kv_heads} not divisible by group_size {group_size}")
-    num_groups = num_kv_heads // group_size
-
     # Stash minimal metadata onto config for downstream modules
+    group_size = args.head_group_size
+    num_groups = model.config.num_key_value_heads // group_size
     setattr(model.config, "group_size", group_size)
     setattr(model.config, "num_groups", num_groups)
     setattr(model.config, "rope_in_latent", True)
@@ -300,42 +293,20 @@ def compress_model_rope_svd(model, tokenizer, args, dev, selection_result):
     for i in range(len(layers)):
         layer = layers[i]
         attn = layer.self_attn
-
         # Build rank lists from selection_result if available
-        k_key = f"model.layers.{i}.self_attn.k_proj"
-        v_key = f"model.layers.{i}.self_attn.v_proj"
-        rank_k_list = selection_result.get(k_key, None)
-        rank_v_list = selection_result.get(v_key, None)
-
-        if isinstance(attn, LlamaPaluAttention):
-            # Already converted: re-instantiate to apply ranks cleanly
-            base_attn = LlamaAttention(model.config, layer_idx=attn.layer_idx)
-            new_attn = LlamaPaluAttention.from_attention(
-                base_attn,
-                model.config,
-                no_fusion=True,
-                rank_k_list=rank_k_list,
-                rank_v_list=rank_v_list,
-                rope_in_latent=True,
-            )
-            logger.debug(f"[rope_svd] Replaced existing LlamaPaluAttention at layer {i}")
-        elif isinstance(attn, LlamaAttention):
-            new_attn = LlamaPaluAttention.from_attention(
-                attn,
-                model.config,
-                no_fusion=True,
-                rank_k_list=rank_k_list,
-                rank_v_list=rank_v_list,
-                rope_in_latent=True,
-            )
-            logger.debug(f"[rope_svd] Converted LlamaAttention -> LlamaPaluAttention at layer {i}")
-        else:
-            logger.warning(f"[rope_svd] Unexpected attention type at layer {i}: {type(attn)}; skip")
-            continue
-
-        # Install
+        k_key, v_key = f"model.layers.{i}.self_attn.k_proj", f"model.layers.{i}.self_attn.v_proj"
+        rank_k_list, rank_v_list = selection_result.get(k_key, None), selection_result.get(v_key, None)
+        assert isinstance(attn, LlamaAttention), f"[rope_svd] Expected LlamaAttention at layer {i}, got {type(attn)}"
+        new_attn = LlamaPaluAttention.from_attention(
+            attn,
+            model.config,
+            no_fusion=True,
+            rank_k_list=rank_k_list,
+            rank_v_list=rank_v_list,
+            rope_in_latent=True,
+        )
         layer.self_attn = new_attn
-        layers[i] = layer
+        logger.debug(f"[rope_svd] Converted LlamaAttention -> LlamaPaluAttention at layer {i}")
 
 # Wrapper for different decompose methods
 def compress_model(model, tokenizer, args, dev, selection_result):
