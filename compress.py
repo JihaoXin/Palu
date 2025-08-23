@@ -123,7 +123,7 @@ if __name__ == "__main__":
         '--decompose_method',
         type=str,
         default='whiten',
-        choices=['whiten', 'svd'],
+        choices=['whiten', 'svd', 'rope_svd'],
         help='Decomposition method'
     )
     
