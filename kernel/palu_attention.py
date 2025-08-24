@@ -164,8 +164,11 @@ class LlamaPaluAttention(LlamaAttention):
     ):
         new_module = LlamaPaluAttention(config, module.layer_idx)
         new_module.q_proj = module.q_proj
-        new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list)
-        new_module.v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, new_module.rank_v_list)
+        # Get rope_latent from config
+        rope_latent = getattr(config, "rope_latent", False)
+        
+        new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list, rope_in_latent=rope_latent)
+        new_module.v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, new_module.rank_v_list, rope_in_latent=rope_latent)
 
         # No fusion version
         if no_fusion:

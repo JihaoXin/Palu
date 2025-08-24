@@ -273,7 +273,8 @@ def compress_model_svd(model, selection_result):
 
 def compress_model_rope_svd(model, selection_result):
     logger.info(f"Start rope_svd decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
-    setattr(model.config, "rope_in_latent", True)
+    # Set rope_latent flag in config for later use
+    setattr(model.config, "rope_latent", True)
     for layername, selected_head_rank in tqdm(selection_result.items()):
         logger.debug(f"Decompose {layername} with ranks: {selected_head_rank}")
         
@@ -295,9 +296,9 @@ def compress_model_rope_svd(model, selection_result):
         
         print("head-wise rope_svd", layername, raw_linear)
         
-        # Create compressed version
+        # Create compressed version with rope_in_latent=True
         head_wise_svd_linear = HeadwiseLowRankModule.from_linear(
-            raw_linear, selected_head_rank
+            raw_linear, selected_head_rank, rope_in_latent=True
         )
         # Replace the module directly
         setattr(parent_module, child_name, head_wise_svd_linear)

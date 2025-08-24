@@ -30,7 +30,9 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
         for name,module in self.named_modules():
             if name in self.head_wise_ranks:
                 info=linear_info[module]
-                new_layer=HeadwiseLowRankModule(self.head_wise_ranks[name],module.in_features,module.out_features,bias=module.bias is not None)
+                # Get rope_in_latent from config
+                rope_in_latent = getattr(config, "rope_latent", False)
+                new_layer=HeadwiseLowRankModule(self.head_wise_ranks[name],module.in_features,module.out_features,bias=module.bias is not None,rope_in_latent=rope_in_latent)
                 setattr(info["father"], info["name"], new_layer)
     
     

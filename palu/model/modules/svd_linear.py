@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .quant import Quantizer
 from .hadamard_utils import apply_hadamard
+from loguru import logger
 
 def _per_head_whiten_decomposition_from_weight(weight, scaling_diag_matrix, rank):
     original_dtype = weight.dtype
@@ -53,10 +54,9 @@ def _per_head_decomposition_from_weight(weight, rank):
 class HeadwiseLowRankModule(nn.Module):
     """ Headwise low rank module """
 
-    def __init__(self, ranks, in_features, out_features, bias):
+    def __init__(self, ranks, in_features, out_features, bias, rope_in_latent=False):
         super().__init__()
-
-
+        self.rope_in_latent = rope_in_latent
         self.ranks = ranks
         self.num_groups = len(ranks)
         self.in_features = in_features
@@ -83,11 +83,18 @@ class HeadwiseLowRankModule(nn.Module):
         
     def forward(self, 
                 hidden_states: torch.Tensor):
-        low_rank_latents = self.project_to_latent(hidden_states)
-        if self.quantized_latents:
-            low_rank_latents = self.quantize_latent(low_rank_latents)
-        outputs = self.reconstruct(low_rank_latents)
-        return outputs
+        if self.rope_in_latent == False:
+            low_rank_latents = self.project_to_latent(hidden_states)
+            if self.quantized_latents:
+                low_rank_latents = self.quantize_latent(low_rank_latents)
+            outputs = self.reconstruct(low_rank_latents)
+            return outputs
+        elif self.rope_in_latent == True:
+            low_rank_latents = self.project_to_latent(hidden_states)
+            if self.quantized_latents:
+                low_rank_latents = self.quantize_latent(low_rank_latents)
+            outputs = self.reconstruct(low_rank_latents)
+            return outputs
     
     
     def project_to_latent(self, hidden_states:  torch.Tensor):
@@ -207,8 +214,10 @@ class HeadwiseLowRankModule(nn.Module):
     def from_linear(
         old_module: nn.Linear,
         ranks: list,
+        rope_in_latent: bool = False,
     ):
-        new_module = HeadwiseLowRankModule(ranks, old_module.in_features, old_module.out_features, bias=old_module.bias is not None)
+        print("from_linear rope_in_latent", rope_in_latent)
+        new_module = HeadwiseLowRankModule(ranks, old_module.in_features, old_module.out_features, bias=old_module.bias is not None, rope_in_latent=rope_in_latent)
         w = old_module.weight.data.reshape(len(ranks), -1, old_module.in_features)
         if old_module.bias is not None:
             b = old_module.bias.data.reshape(len(ranks), -1)
