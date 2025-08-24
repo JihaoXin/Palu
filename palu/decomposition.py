@@ -270,7 +270,6 @@ def compress_model_svd(model, selection_result):
         # Replace the module directly
         setattr(parent_module, child_name, head_wise_svd_linear)
 
-
 def compress_model_rope_svd(model, selection_result):
     logger.info(f"Start rope_svd decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
     # Set rope_latent flag in config for later use
@@ -303,13 +302,61 @@ def compress_model_rope_svd(model, selection_result):
         # Replace the module directly
         setattr(parent_module, child_name, head_wise_svd_linear)
 
+def compress_model_svd_attention(model, selection_result):
+    """Replace LlamaAttention with LlamaPaluAttention using ranks from selection_result.
+
+    Behavior mirrors compress_model_svd but at the attention module level.
+    This sets minimal config fields required by LlamaPaluAttention.from_attention.
+    """
+    from transformers.models.llama.modeling_llama import LlamaAttention
+    from kernel.palu_attention import LlamaPaluAttention
+
+    # Iterate decoder layers and replace self_attn
+    # Only handle LLaMA-like models where layers are under model.model.layers
+    try:
+        layers = model.model.layers
+    except Exception:
+        return
+
+    for i, layer in enumerate(layers):
+        attn = layer.self_attn
+        if not isinstance(attn, LlamaAttention):
+            continue
+
+        # Collect per-layer rank lists from selection_result
+        k_key = f"model.layers.{i}.self_attn.k_proj"
+        v_key = f"model.layers.{i}.self_attn.v_proj"
+        rank_k_list = selection_result.get(k_key, None)
+        rank_v_list = selection_result.get(v_key, None)
+        assert rank_k_list is not None and rank_v_list is not None, f"Rank list is None for {k_key} or {v_key}"
+
+        # Derive config fields for LlamaPaluAttention
+        num_groups = len(rank_k_list)
+        total_rank_k = sum(rank_k_list)
+        total_rank_v = sum(rank_v_list)
+        setattr(model.config, "num_groups", num_groups)
+        setattr(model.config, "total_rank_k", total_rank_k)
+        setattr(model.config, "total_rank_v", total_rank_v)
+        try:
+            group_size = model.config.num_key_value_heads // num_groups
+        except Exception:
+            group_size = 1
+        setattr(model.config, "group_size", group_size)
+
+        # Replace attention
+        new_attn = LlamaPaluAttention.from_attention(attn, model.config, no_fusion=True)
+        layer.self_attn = new_attn
+
 # Wrapper for different decompose methods
 def compress_model(model, tokenizer, args, dev, selection_result):
+    logger.info("Model compressing...", fg="green")
     if args.decompose_method == "whiten":
         compress_model_whiten(model, tokenizer, args, dev, selection_result)
     elif args.decompose_method == "svd":
         compress_model_svd(model, selection_result)
     elif args.decompose_method == "rope_svd":
         compress_model_rope_svd(model, selection_result)
+    elif args.decompose_method == "svd_attention":
+        compress_model_svd_attention(model, selection_result)
     else:
         raise ValueError(f"Decomposition method {args.decompose_method} is not supported.")

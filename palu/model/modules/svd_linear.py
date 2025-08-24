@@ -216,7 +216,6 @@ class HeadwiseLowRankModule(nn.Module):
         ranks: list,
         rope_in_latent: bool = False,
     ):
-        print("from_linear rope_in_latent", rope_in_latent)
         new_module = HeadwiseLowRankModule(ranks, old_module.in_features, old_module.out_features, bias=old_module.bias is not None, rope_in_latent=rope_in_latent)
         w = old_module.weight.data.reshape(len(ranks), -1, old_module.in_features)
         if old_module.bias is not None:

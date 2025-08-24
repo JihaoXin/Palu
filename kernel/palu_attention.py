@@ -22,7 +22,8 @@ class LlamaPaluAttention(LlamaAttention):
     """
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        
+        self.num_heads = config.num_key_value_heads // config.num_groups
+        self.hidden_size = config.hidden_size
         self.group_size = config.group_size
         self.num_groups = config.num_groups
         self.total_rank_k = config.total_rank_k
@@ -38,123 +39,123 @@ class LlamaPaluAttention(LlamaAttention):
         self.v_proj = HeadwiseLowRankModule(self.rank_v_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.fused_hidden_dim_o, self.hidden_size, bias=config.attention_bias)
         
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        golden_kernel: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     attention_mask: Optional[torch.Tensor] = None,
+    #     position_ids: Optional[torch.LongTensor] = None,
+    #     past_key_value: Optional[Cache] = None,
+    #     output_attentions: bool = False,
+    #     golden_kernel: bool = False,
+    #     **kwargs,
+    # ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    #     if "padding_mask" in kwargs:
+    #         warnings.warn(
+    #             "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+    #         )
 
-        bsz, q_len, _ = hidden_states.size()
+    #     bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
-        key_h_states = self.k_proj.project_to_latent(hidden_states)
-        value_h_states = self.v_proj.project_to_latent(hidden_states)
+    #     query_states = self.q_proj(hidden_states)
+    #     # key_states = self.k_proj(hidden_states)
+    #     # value_states = self.v_proj(hidden_states)
+    #     key_h_states = self.k_proj.project_to_latent(hidden_states)
+    #     value_h_states = self.v_proj.project_to_latent(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        key_h_states = key_h_states.view(bsz, q_len, self.num_groups, self.group_rank_k).transpose(1, 2)
-        value_h_states = value_h_states.view(bsz, q_len, self.num_groups, self.group_rank_v).transpose(1, 2)
+    #     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    #     # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    #     # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    #     key_h_states = key_h_states.view(bsz, q_len, self.num_groups, self.group_rank_k).transpose(1, 2)
+    #     value_h_states = value_h_states.view(bsz, q_len, self.num_groups, self.group_rank_v).transpose(1, 2)
 
-        # kv_seq_len = key_states.shape[-2]
-        kv_seq_len = key_h_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+    #     # kv_seq_len = key_states.shape[-2]
+    #     kv_seq_len = key_h_states.shape[-2]
+    #     if past_key_value is not None:
+    #         if self.layer_idx is None:
+    #             raise ValueError(
+    #                 f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+    #                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+    #                 "with a layer index."
+    #             )
+    #         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         
-        # cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    #     # cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
+    #     # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            key_h_states, value_h_states = past_key_value.update(key_h_states, value_h_states, self.layer_idx)
-
-
-        if q_len > 1:
-            # Prompting
-            # Recompute the key states
-            key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
-            key_states = self.k_proj.reconstruct(key_h_states)
-            key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-            # Apply RoPE after recomputing the key states
-            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        else:
-            # Generating (Apply our reconsturction kernel)
-            # A: (num_heads, 1, head_dim)
-            # B: (num_heads, rank_per_groups, head_dim)
-            # X: (num_head_groups, seq_len, rank_per_groups)
-            # TODO: Optimize RoPE & sqrt(head_dim) into kernel
-            # TODO: Check if sin & cos are share among different blocks
-            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-            query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin, position_ids)
-            A = query_states.squeeze(0)
-            B = self.k_proj.B
-            X = key_h_states.squeeze(0)
-            attn_weights = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
-
-        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
+    #     if past_key_value is not None:
+    #         # cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+    #         # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+    #         key_h_states, value_h_states = past_key_value.update(key_h_states, value_h_states, self.layer_idx)
 
 
-        # Upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+    #     if q_len > 1:
+    #         # Prompting
+    #         # Recompute the key states
+    #         key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
+    #         key_states = self.k_proj.reconstruct(key_h_states)
+    #         key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # Original version
-        # value_states = self.v_proj.reconstruct(value_h_states)
-        # value_states = value_states.reshape(1, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # attn_output = torch.matmul(attn_weights, value_states)
+    #         # Apply RoPE after recomputing the key states
+    #         cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
+    #         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    #         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+    #     else:
+    #         # Generating (Apply our reconsturction kernel)
+    #         # A: (num_heads, 1, head_dim)
+    #         # B: (num_heads, rank_per_groups, head_dim)
+    #         # X: (num_head_groups, seq_len, rank_per_groups)
+    #         # TODO: Optimize RoPE & sqrt(head_dim) into kernel
+    #         # TODO: Check if sin & cos are share among different blocks
+    #         cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
+    #         query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin, position_ids)
+    #         A = query_states.squeeze(0)
+    #         B = self.k_proj.B
+    #         X = key_h_states.squeeze(0)
+    #         attn_weights = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
 
-        # Fusion version
-        # attn_weights: (bsz, num_groups, q_len * group_size, kv_seq_len)
-        attn_h_weights = attn_weights.reshape(1, self.num_groups, q_len * self.group_size, kv_seq_len)
-        attn_h_output = torch.matmul(attn_h_weights, value_h_states)
-        # attn_h_output: (bsz, num_heads, q_len * group_size, group_rank)
-        attn_output = attn_h_output.reshape(1, self.num_heads, q_len, self.group_rank_v)
+    #     # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+    #     if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+    #         raise ValueError(
+    #             f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+    #             f" {attn_weights.size()}"
+    #         )
+
+    #     if attention_mask is not None:
+    #         if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+    #             raise ValueError(
+    #                 f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+    #             )
+    #         attn_weights = attn_weights + attention_mask
 
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+    #     # Upcast attention to fp32
+    #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    #     attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
-        attn_output = self.o_proj(attn_output)
+    #     # Original version
+    #     # value_states = self.v_proj.reconstruct(value_h_states)
+    #     # value_states = value_states.reshape(1, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    #     # attn_output = torch.matmul(attn_weights, value_states)
+
+    #     # Fusion version
+    #     # attn_weights: (bsz, num_groups, q_len * group_size, kv_seq_len)
+    #     attn_h_weights = attn_weights.reshape(1, self.num_groups, q_len * self.group_size, kv_seq_len)
+    #     attn_h_output = torch.matmul(attn_h_weights, value_h_states)
+    #     # attn_h_output: (bsz, num_heads, q_len * group_size, group_rank)
+    #     attn_output = attn_h_output.reshape(1, self.num_heads, q_len, self.group_rank_v)
+
+
+    #     attn_output = attn_output.transpose(1, 2).contiguous()
+    #     attn_output = attn_output.reshape(bsz, q_len, -1)
+
+    #     attn_output = self.o_proj(attn_output)
         
         
-        if not output_attentions:
-            attn_weights = None
+    #     if not output_attentions:
+    #         attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+    #     return attn_output, attn_weights, past_key_value
     
     @staticmethod
     def from_attention(
@@ -166,7 +167,6 @@ class LlamaPaluAttention(LlamaAttention):
         new_module.q_proj = module.q_proj
         # Get rope_latent from config
         rope_latent = getattr(config, "rope_latent", False)
-        
         new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list, rope_in_latent=rope_latent)
         new_module.v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, new_module.rank_v_list, rope_in_latent=rope_latent)
 

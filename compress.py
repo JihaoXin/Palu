@@ -20,11 +20,11 @@ def compress(args):
     search_results, rank_sum, total_rank = rank_search(model, tokenizer, args)
     # Step 2: Compress models
     compress_model(model, tokenizer, args, args.device, search_results)
-    
+    logger.info("🎉🎉🎉Model compression done...🎉🎉🎉", fg="green")
     if args.dump_huggingface_model:
         save_folder = f"{args.model_id.split('/')[-1]}_ratio-{args.param_ratio_target}_gs-{args.head_group_size}-{args.search_method}-{args.decompose_method}"
         dump_to_huggingface_repos(model, tokenizer, save_folder, args)
-        logger.info(f"Huggingface model is saved to {save_folder}", fg="green")
+        logger.info(f"🎉🎉🎉CompressedHuggingface model is saved to {save_folder}🎉🎉🎉", fg="green")
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -123,7 +123,7 @@ if __name__ == "__main__":
         '--decompose_method',
         type=str,
         default='whiten',
-        choices=['whiten', 'svd', 'rope_svd'],
+        choices=['whiten', 'svd', 'rope_svd', 'svd_attention'],
         help='Decomposition method'
     )
     
