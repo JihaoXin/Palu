@@ -302,44 +302,6 @@ def compress_model_rope_svd(model, selection_result):
         # Replace the module directly
         setattr(parent_module, child_name, head_wise_svd_linear)
 
-# @torch.no_grad()
-# def compress_model_rope_svd(model, tokenizer, args, dev, selection_result):
-#     """
-#     Minimal rope_svd implementation:
-#     - Per layer: replace `self_attn: LlamaAttention` with `LlamaPaluAttention`.
-#     - Ranks come from `selection_result` for k_proj / v_proj (group-wise ranks list).
-#     - Avoid fusion path to keep shapes simple; perform standard attn with reconstructed V.
-#     - Enable latent-space RoPE inside attention (query uses standard RoPE; keys apply RoPE on latent before reconstruct).
-#     """
-#     logger.info("[rope_svd] Converting LlamaAttention -> LlamaPaluAttention (no_fusion, rope_in_latent)")
-
-#     # Stash minimal metadata onto config for downstream modules
-#     group_size = args.head_group_size
-#     num_groups = model.config.num_key_value_heads // group_size
-#     setattr(model.config, "group_size", group_size)
-#     setattr(model.config, "num_groups", num_groups)
-#     setattr(model.config, "rope_in_latent", True)
-
-#     # Iterate layers and replace attention
-#     layers = model.model.layers
-#     for i in range(len(layers)):
-#         layer = layers[i]
-#         attn = layer.self_attn
-#         # Build rank lists from selection_result if available
-#         k_key, v_key = f"model.layers.{i}.self_attn.k_proj", f"model.layers.{i}.self_attn.v_proj"
-#         rank_k_list, rank_v_list = selection_result.get(k_key, None), selection_result.get(v_key, None)
-#         assert isinstance(attn, LlamaAttention), f"[rope_svd] Expected LlamaAttention at layer {i}, got {type(attn)}"
-#         new_attn = LlamaPaluAttention.from_attention(
-#             attn,
-#             model.config,
-#             no_fusion=True,
-#             # rank_k_list=rank_k_list,
-#             # rank_v_list=rank_v_list,
-#             # rope_in_latent=True,
-#         )
-#         layer.self_attn = new_attn
-#         logger.debug(f"[rope_svd] Converted LlamaAttention -> LlamaPaluAttention at layer {i}")
-
 # Wrapper for different decompose methods
 def compress_model(model, tokenizer, args, dev, selection_result):
     if args.decompose_method == "whiten":
