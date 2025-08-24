@@ -10,116 +10,10 @@ from transformers.models.llama.modeling_llama import (
     LlamaAttention, LlamaConfig,
 )
 
+# Import HeadwiseLowRankModule from svd_linear.py instead of defining it here
+from palu.model.modules.svd_linear import HeadwiseLowRankModule
+
 from .abx_rope import abx as recompute_k_gemv
-
-
-class HeadwiseLowRankModule(nn.Module):
-    """ Headwise Low-Rank module """
-    def __init__(self, ranks, in_features, out_features, bias):
-        super().__init__()
-
-        self.ranks = ranks
-        self.num_groups = len(ranks)
-        self.in_features = in_features
-        self.out_features = out_features
-        self.group_dim = out_features // self.num_groups
-
-        if (self.group_dim * self.num_groups) != self.out_features:
-            raise ValueError(
-                f"out_features must be divisible by num_groups (got `out_features`: {self.out_features}"
-                f" and `num_groups`: {self.num_groups})."
-            )
-
-        self.VT = nn.Linear(in_features, sum(ranks), bias=False)
-
-        # Create the list of linear layers first
-        Us = []
-        for r in ranks:
-            linear_layer = nn.Linear(r, self.group_dim, bias=bias)
-            nn.init.normal_(linear_layer.weight)
-            Us.append(linear_layer)
-
-        self.U_list = nn.ModuleList(Us)
-    
-    def forward(self, hidden_states: torch.Tensor):
-        """ hidden_states: Tensor of shape (batch_size, seq_len, in_features) """
-        assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
-        
-        hidden_states = self.VT(hidden_states)
-
-        # hidden_states: Tensor of shape (batch_size, seq_len, r1 + r2 + ... )
-        outputs = []
-        total_ranks = 0
-        for i in range(self.num_groups):
-            outputs.append(self.U_list[i](hidden_states[:, :, total_ranks: total_ranks+self.ranks[i]]))
-            total_ranks += self.ranks[i]
-
-        return torch.cat(outputs, dim=-1)
-
-    def project_to_latent(self, hidden_states: torch.Tensor):
-        """ hidden_states: Tensor of shape (batch_size, seq_len, in_features) """
-        assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
-
-        hidden_states = self.VT(hidden_states)
-
-        return hidden_states
-    
-    def reconstruct(self, hidden_states: torch.Tensor):
-        """ hidden_states: Tensor of shape (batch_size, seq_len, sum(ranks)) """
-        assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
-
-        outputs = []
-        total_ranks = 0
-        for i in range(self.num_groups):
-            outputs.append(self.U_list[i](hidden_states[:, :, total_ranks: total_ranks+self.ranks[i]]))
-            total_ranks += self.ranks[i]
-
-        return torch.cat(outputs, dim=-1)
-    
-    @staticmethod
-    def from_linear(
-        old_module: nn.Linear,
-        ranks: list,
-        attn_module: LlamaAttention = None,
-    ):   
-        new_module = HeadwiseLowRankModule(ranks, old_module.in_features, old_module.out_features, bias=old_module.bias is not None)
-        w = old_module.weight.data.reshape(len(ranks), -1, old_module.in_features).float()
-
-        wl = []
-        wr = []
-        for i in range(len(ranks)):
-            l, s, r = torch.linalg.svd(w[i], full_matrices=False)
-            l = l[:, 0:ranks[i]]
-            s = s[0:ranks[i]]
-            r = r[0:ranks[i], :]
-            l = l.mul(s)
-
-            # l: (head_dim, rank), r: (rank, hidden_size)
-            wl.append(l)
-            wr.append(r)
-
-        # load to U
-        for i in range(len(ranks)):
-            if new_module.U_list[i].weight.data.shape != wl[i].shape:
-                raise ValueError(f"{new_module.U_list[i].weight.data.shape} != {wl[i].shape}")
-            new_module.U_list[i].weight.data = wl[i].contiguous()
-        
-        # Create B matrix for kernel
-        if attn_module is not None:
-            U_list_T = [x.weight.data.T for x in new_module.U_list]
-            b = torch.stack(U_list_T)
-            b = b.reshape(new_module.num_groups, new_module.ranks[0], attn_module.group_size, attn_module.head_dim)
-            b = b.transpose(1, 2)
-            b = b.reshape(attn_module.num_heads, new_module.ranks[0], attn_module.head_dim)
-            new_module.B = nn.Parameter(b)
-
-        # load to VT
-        # shape (sum(ranks), hidden_size)
-        VT_weight = torch.cat(wr, dim=0).contiguous()
-        assert new_module.VT.weight.data.shape == VT_weight.shape
-        new_module.VT.weight.data = VT_weight
-        
-        return new_module
 
 class LlamaPaluAttention(LlamaAttention):
     """
@@ -270,7 +164,7 @@ class LlamaPaluAttention(LlamaAttention):
     ):
         new_module = LlamaPaluAttention(config, module.layer_idx)
         new_module.q_proj = module.q_proj
-        new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list, new_module)
+        new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list)
         new_module.v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, new_module.rank_v_list)
 
         # No fusion version
