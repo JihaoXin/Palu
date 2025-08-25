@@ -4,10 +4,11 @@ from kernel.palu_attention import LlamaPaluAttention
 import torch.nn as nn
 import torch
 import os
-import click
 from tqdm import tqdm
 from .data_utils import get_calib_data
 from .model import HeadwiseLowRankModule
+from transformers.models.llama.modeling_llama import LlamaAttention
+from kernel.palu_attention import LlamaPaluAttention
 
 def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
     if type(module) in layers:
@@ -239,105 +240,21 @@ def compress_model_whiten(model, tokenizer, args, dev, selection_result):
         )
         setattr(info["father"], info["name"],  head_wise_svd_linear)
 
-# def compress_model_svd(model, selection_result):
-#     logger.info(f"Start decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
-#     for layername, selected_head_rank in tqdm(selection_result.items()):
-#         logger.debug(f"Decompose {layername} with ranks: {selected_head_rank}")
-        
-#         # Parse the full path: e.g., "model.layers.0.self_attn.k_proj"
-#         path_parts = layername.split('.')
-#         parent_path = path_parts[:-1]  # ["model", "layers", "0", "self_attn"]  
-#         child_name = path_parts[-1]    # "k_proj"
-        
-#         # Navigate to the parent module step by step
-#         parent_module = model
-#         for attr in parent_path:
-#             if attr.isdigit():  # Handle numeric indices like layers[0]
-#                 parent_module = parent_module[int(attr)]
-#             else:
-#                 parent_module = getattr(parent_module, attr)
-        
-#         # Get the Linear module to be replaced
-#         raw_linear = getattr(parent_module, child_name)
-        
-#         print("head-wise svd", layername, raw_linear)
-        
-#         # Create compressed version
-#         head_wise_svd_linear = HeadwiseLowRankModule.from_linear(
-#             raw_linear, selected_head_rank
-#         )
-        
-#         # Replace the module directly
-#         setattr(parent_module, child_name, head_wise_svd_linear)
-
-def compress_model_rope_svd(model, selection_result):
-    logger.info(f"Start rope_svd decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
-    # Set rope_latent flag in config for later use
-    setattr(model.config, "rope_latent", True)
-    setattr(model.config, "v_fusion", False)
-    for layername, selected_head_rank in tqdm(selection_result.items()):
-        logger.debug(f"Decompose {layername} with ranks: {selected_head_rank}")
-        
-        # Parse the full path: e.g., "model.layers.0.self_attn.k_proj"
-        path_parts = layername.split('.')
-        parent_path = path_parts[:-1]  # ["model", "layers", "0", "self_attn"]  
-        child_name = path_parts[-1]    # "k_proj"
-        
-        # Navigate to the parent module step by step
-        parent_module = model
-        for attr in parent_path:
-            if attr.isdigit():  # Handle numeric indices like layers[0]
-                parent_module = parent_module[int(attr)]
-            else:
-                parent_module = getattr(parent_module, attr)
-        
-        # Get the Linear module to be replaced
-        raw_linear = getattr(parent_module, child_name)
-        
-        print("head-wise rope_svd", layername, raw_linear)
-        
-        # Create compressed version with rope_in_latent=True
-        head_wise_svd_linear = HeadwiseLowRankModule.from_linear(
-            raw_linear, selected_head_rank, rope_in_latent=True
-        )
-        # Replace the module directly
-        setattr(parent_module, child_name, head_wise_svd_linear)
-
-def compress_model_svd(model, selection_result):
+def compress_model_svd(model, args, selection_result):
     """Replace LlamaAttention with LlamaPaluAttention using ranks from selection_result."""
-    from transformers.models.llama.modeling_llama import LlamaAttention
-    from kernel.palu_attention import LlamaPaluAttention
-
-    # Only handle LLaMA-like models where layers are under model.model.layers
-    try:
-        layers = model.model.layers
-    except Exception:
-        return
-
-    # Store all ranks in head_wise_ranks for later use
-    setattr(model.config, "head_wise_ranks", selection_result)
-    
     # Set global config only once (using first layer as reference)
-    first_k_key = "model.layers.0.self_attn.k_proj"
-    first_v_key = "model.layers.0.self_attn.v_proj"
-    if first_k_key in selection_result and first_v_key in selection_result:
-        first_rank_k_list = selection_result[first_k_key]
-        first_rank_v_list = selection_result[first_v_key]
-        num_groups = len(first_rank_k_list)
-        group_size = model.config.num_key_value_heads // num_groups
-        
-        setattr(model.config, "num_groups", num_groups)
-        setattr(model.config, "group_size", group_size)
-        # Note: We don't set total_rank_k/v as they're not meaningful in layer-wise compression
+    group_size = args.head_group_size
+    num_groups = model.config.num_key_value_heads // args.head_group_size
+    setattr(model.config, "group_size", group_size) # number of heads in each Palu G-LDR group
+    setattr(model.config, "num_groups", num_groups) # number of Palu G-LDR groups
+    setattr(model.config, "v_fusion", args.v_fusion)
+    setattr(model.config, "head_wise_ranks", selection_result)
 
     # Replace each attention layer
-    for i, layer in enumerate(layers):
+    for i, layer in enumerate(model.model.layers):
         attn = layer.self_attn
-        if not isinstance(attn, LlamaAttention):
-            continue
-
-        # Replace attention using from_attention
-        new_attn = LlamaPaluAttention.from_attention(attn, model.config, v_fusion=model.config.v_fusion)
+        assert isinstance(attn, LlamaAttention), "Original model's attention should be LlamaAttention"
+        new_attn = LlamaPaluAttention.from_attention(attn, model.config)
         layer.self_attn = new_attn
 
 # Wrapper for different decompose methods
@@ -346,7 +263,7 @@ def compress_model(model, tokenizer, args, dev, selection_result):
     if args.decompose_method == "whiten":
         compress_model_whiten(model, tokenizer, args, dev, selection_result)
     elif args.decompose_method == "svd":
-        compress_model_svd(model, selection_result)
+        compress_model_svd(model, args, selection_result)
     elif args.decompose_method == "rope_svd":
         compress_model_rope_svd(model, selection_result)
     else:

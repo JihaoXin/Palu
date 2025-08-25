@@ -20,7 +20,6 @@ def compress(args):
     search_results, rank_sum, total_rank = rank_search(model, tokenizer, args)
     # Step 2: Compress models
     compress_model(model, tokenizer, args, args.device, search_results)
-    model.config.v_fusion = False
     logger.info("🎉🎉🎉Model compression done...🎉🎉🎉", fg="green")
     if args.dump_huggingface_model:
         save_folder = f"{args.model_id.split('/')[-1]}_ratio-{args.param_ratio_target}_gs-{args.head_group_size}-{args.search_method}-{args.decompose_method}"
@@ -128,8 +127,12 @@ if __name__ == "__main__":
         help='Decomposition method'
     )
     
+    parser.add_argument(
+        "--v_fusion", 
+        action="store_true",
+        help="Whether to use v_fusion or not."
+    )
     args = parser.parse_args()
-    
     logger.remove()
     logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True, level="INFO" if not args.verbose else "DEBUG")
     

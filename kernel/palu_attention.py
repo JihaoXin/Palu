@@ -44,25 +44,21 @@ class LlamaPaluAttention(LlamaAttention):
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         
         # K/V: Low-rank modules
-        rope_in_latent = getattr(config, "rope_latent", False)
         self.k_proj = HeadwiseLowRankModule(
             self.rank_k_list, 
             self.hidden_size, 
             self.num_key_value_heads * self.head_dim, 
             bias=config.attention_bias,
-            rope_in_latent=rope_in_latent
         )
         self.v_proj = HeadwiseLowRankModule(
             self.rank_v_list, 
             self.hidden_size, 
             self.num_key_value_heads * self.head_dim, 
             bias=config.attention_bias,
-            rope_in_latent=rope_in_latent
         )
         
         # O: Output projection with fused dimension
-        v_fusion = getattr(config, "v_fusion", False)
-        if v_fusion:
+        if config.v_fusion:
             self.o_proj = nn.Linear(self.fused_hidden_dim_o, self.hidden_size, bias=config.attention_bias)
         else:
             self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
@@ -189,14 +185,12 @@ class LlamaPaluAttention(LlamaAttention):
     def from_attention(
         module: LlamaAttention,
         config: LlamaConfig,
-        v_fusion: bool = False,
     ):
         """
         从标准的 LlamaAttention 创建 LlamaPaluAttention。
         Args:
             module: 原始的 LlamaAttention 模块
             config: 配置对象，包含 head_wise_ranks 等信息
-            v_fusion: 是否禁用融合优化
         """
         # 创建新的 LlamaPaluAttention 实例 (会根据 config.head_wise_ranks 自动初始化)
         new_module = LlamaPaluAttention(config, module.layer_idx)
@@ -205,20 +199,17 @@ class LlamaPaluAttention(LlamaAttention):
         new_module.q_proj = module.q_proj
         
         # K/V 投影处理
-        rope_latent = getattr(config, "rope_latent", False)
         new_module.k_proj = HeadwiseLowRankModule.from_linear(
             module.k_proj, 
             new_module.rank_k_list, 
-            rope_in_latent=rope_latent
         )
         new_module.v_proj = HeadwiseLowRankModule.from_linear(
             module.v_proj, 
             new_module.rank_v_list, 
-            rope_in_latent=rope_latent
         )
 
         # No fusion version
-        if not v_fusion:
+        if not config.v_fusion:
             new_module.o_proj = module.o_proj
             return new_module
 
