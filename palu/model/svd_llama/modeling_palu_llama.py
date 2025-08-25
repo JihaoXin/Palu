@@ -1,4 +1,5 @@
 from transformers import LlamaForCausalLM
+from transformers.models.llama.modeling_llama import LlamaAttention
 import torch.nn as nn
 from types import SimpleNamespace
 from .configuration_palu_llama import PaluLlamaConfig
@@ -27,6 +28,10 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
                     modules.append(raw_linear)
 
 
+        # Handle different decompose methods
+        decompose_method = getattr(config, "decompose_method", "svd")
+        
+        # Replace linear layers with HeadwiseLowRankModule for all methods
         for name,module in self.named_modules():
             if name in self.head_wise_ranks:
                 info=linear_info[module]
@@ -34,7 +39,22 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
                 rope_in_latent = getattr(config, "rope_latent", False)
                 new_layer=HeadwiseLowRankModule(self.head_wise_ranks[name],module.in_features,module.out_features,bias=module.bias is not None,rope_in_latent=rope_in_latent)
                 setattr(info["father"], info["name"], new_layer)
+        
+        # For svd_attention, also replace attention layers in __init__
+        if decompose_method == "svd_attention":
+            self._replace_attention_layers_in_init()
     
+    def _replace_attention_layers_in_init(self):
+        """Replace LlamaAttention with LlamaPaluAttention during __init__."""
+        from kernel.palu_attention import LlamaPaluAttention
+        
+        for layer in self.model.layers:
+            if isinstance(layer.self_attn, LlamaAttention):
+                layer.self_attn = LlamaPaluAttention.from_attention(
+                    layer.self_attn, 
+                    self.config,
+                    no_fusion=True
+                )
     
     @staticmethod
     def get_kv_info(llama: LlamaForCausalLM, num_heads_in_lr_groups: int):

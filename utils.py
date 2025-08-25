@@ -71,6 +71,13 @@ def dump_to_huggingface_repos(model, tokenizer, save_path, args):
         raise NotImplementedError
             
     config["original_model_name_or_path"] = model.config._name_or_path
+    
+    # Save decompose_method and rope_latent from args/config
+    if hasattr(args, 'decompose_method'):
+        config["decompose_method"] = args.decompose_method
+    if hasattr(model.config, 'rope_latent'):
+        config["rope_latent"] = model.config.rope_latent
+    
     import json
 
     json.dump(config, open(save_path + "/config.json", "w"), indent=2)
