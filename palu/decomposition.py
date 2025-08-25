@@ -240,6 +240,24 @@ def compress_model_whiten(model, tokenizer, args, dev, selection_result):
         )
         setattr(info["father"], info["name"],  head_wise_svd_linear)
 
+def compress_model_whiten(model, tokenizer, args, dev, selection_result):
+    """Replace LlamaAttention with LlamaPaluAttention using ranks from selection_result."""
+    # Set global config only once (using first layer as reference)
+    get_whiten_scale_matrix(model, tokenizer, args, dev)
+    group_size = args.head_group_size
+    num_groups = model.config.num_key_value_heads // args.head_group_size
+    setattr(model.config, "group_size", group_size) # number of heads in each Palu G-LDR group
+    setattr(model.config, "num_groups", num_groups) # number of Palu G-LDR groups
+    setattr(model.config, "v_fusion", args.v_fusion)
+    setattr(model.config, "head_wise_ranks", selection_result)
+
+    # Replace each attention layer
+    for i, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        assert isinstance(attn, LlamaAttention), "Original model's attention should be LlamaAttention"
+        new_attn = LlamaPaluAttention.from_attention(attn, model.config, whiten=True)
+        layer.self_attn = new_attn
+
 def compress_model_svd(model, args, selection_result):
     """Replace LlamaAttention with LlamaPaluAttention using ranks from selection_result."""
     # Set global config only once (using first layer as reference)
@@ -264,7 +282,7 @@ def compress_model(model, tokenizer, args, dev, selection_result):
         compress_model_whiten(model, tokenizer, args, dev, selection_result)
     elif args.decompose_method == "svd":
         compress_model_svd(model, args, selection_result)
-    elif args.decompose_method == "rope_svd":
+    # elif args.decompose_method == "rope_svd":
         compress_model_rope_svd(model, selection_result)
     else:
         raise ValueError(f"Decomposition method {args.decompose_method} is not supported.")

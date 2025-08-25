@@ -185,6 +185,7 @@ class LlamaPaluAttention(LlamaAttention):
     def from_attention(
         module: LlamaAttention,
         config: LlamaConfig,
+        whiten: bool = False,
     ):
         """
         从标准的 LlamaAttention 创建 LlamaPaluAttention。
@@ -199,14 +200,24 @@ class LlamaPaluAttention(LlamaAttention):
         new_module.q_proj = module.q_proj
         
         # K/V 投影处理
-        new_module.k_proj = HeadwiseLowRankModule.from_linear(
-            module.k_proj, 
-            new_module.rank_k_list, 
-        )
-        new_module.v_proj = HeadwiseLowRankModule.from_linear(
-            module.v_proj, 
-            new_module.rank_v_list, 
-        )
+        if whiten:
+            new_module.k_proj = HeadwiseLowRankModule.from_linear_whiten(
+                module.k_proj, 
+                new_module.rank_k_list, 
+            )
+            new_module.v_proj = HeadwiseLowRankModule.from_linear_whiten(
+                module.v_proj, 
+                new_module.rank_v_list, 
+            )
+        else:
+            new_module.k_proj = HeadwiseLowRankModule.from_linear(
+                module.k_proj, 
+                new_module.rank_k_list, 
+            )
+            new_module.v_proj = HeadwiseLowRankModule.from_linear(
+                module.v_proj, 
+                new_module.rank_v_list, 
+            )
 
         # No fusion version
         if not config.v_fusion:
