@@ -77,6 +77,8 @@ def dump_to_huggingface_repos(model, tokenizer, save_path, args):
         config["decompose_method"] = args.decompose_method
     if hasattr(model.config, 'rope_latent'):
         config["rope_latent"] = model.config.rope_latent
+    if hasattr(model.config, 'v_fusion'):
+        config["v_fusion"] = model.config.v_fusion
     
     import json
 
