@@ -164,20 +164,41 @@ class LlamaPaluAttention(LlamaAttention):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
-        Completely identical to LlamaAttention.forward - let's copy it exactly
+        Forward with conditional RoPE in latent space support
         """
         if not hasattr(self, '_printed_once'):
-            print("😄😄😄😄😄😄😄😄😄😄😄layer {}: Using PaluAttention (EXACT COPY). RoPE Latent: {}".format(self.layer_idx, self.rope_latent))
+            print("😄😄😄😄😄😄😄😄😄😄😄layer {}: Using PaluAttention. RoPE Latent: {}".format(self.layer_idx, self.rope_latent))
             self._printed_once = True
+            
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        # Q projection (always standard)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
+        
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        if self.rope_latent:
+            # RoPE in latent space: RoPE(x@U)@V
+            
+            # K projection: x@U -> apply RoPE -> @V
+            key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U
+            key_latents_rope = self._apply_rope_to_latents(key_latents, cos, sin)  # RoPE(x@U)
+            key_states = self.k_proj.reconstruct(key_latents_rope).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
+            
+            # V projection (standard for now)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            
+            # Apply RoPE to Q (standard)
+            query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
+            
+        else:
+            # Standard path: identical to LlamaAttention
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            
+            # Apply RoPE to both Q and K (standard)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -209,6 +230,49 @@ class LlamaPaluAttention(LlamaAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+    
+    def _apply_rope_to_latents(self, latents: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RoPE to grouped latent states - simplified version
+        
+        Args:
+            latents: [batch, seq_len, total_latent_dim] 
+            cos, sin: RoPE embeddings [batch, seq_len, head_dim]
+            
+        Returns:
+            latents_rope: [batch, seq_len, total_latent_dim]
+        """
+        batch_size, seq_len, total_latent_dim = latents.shape
+        
+        # For simplicity, apply RoPE only to the first head_dim dimensions of the latents
+        # This is a reasonable approximation for the RoPE(x@U)@V approach
+        rope_dim = min(total_latent_dim, self.head_dim)
+        
+        if rope_dim == total_latent_dim:
+            # All dimensions get RoPE
+            # Reshape to [batch, 1, seq_len, total_latent_dim] for apply_rotary_pos_emb
+            latents_reshaped = latents.unsqueeze(1)  # [batch, 1, seq_len, total_latent_dim]
+            cos_truncated = cos[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
+            sin_truncated = sin[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
+            
+            latents_rope, _ = apply_rotary_pos_emb(latents_reshaped, latents_reshaped, cos_truncated, sin_truncated)
+            return latents_rope.squeeze(1)
+        else:
+            # Split into RoPE part and non-RoPE part
+            rope_part = latents[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
+            non_rope_part = latents[:, :, rope_dim:]  # [batch, seq_len, remaining_dim]
+            
+            # Apply RoPE to rope_part
+            rope_part_reshaped = rope_part.unsqueeze(1)  # [batch, 1, seq_len, rope_dim]
+            cos_truncated = cos[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
+            sin_truncated = sin[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
+            
+            rope_part_rotated, _ = apply_rotary_pos_emb(rope_part_reshaped, rope_part_reshaped, cos_truncated, sin_truncated)
+            rope_part_rotated = rope_part_rotated.squeeze(1)  # [batch, seq_len, rope_dim]
+            
+            # Concatenate back
+            latents_rope = torch.cat([rope_part_rotated, non_rope_part], dim=-1)
+            return latents_rope
 
     # def forward(
     #     self,
