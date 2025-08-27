@@ -96,9 +96,8 @@ def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda")
             batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(
                     device
                 )
-            outputs = model.model(batch)
-            hidden_states = outputs[0]
-            logits = model.lm_head(hidden_states)  # .contiguous()
+            outputs = model(batch)
+            logits = outputs.logits
             shift_logits = logits[:, :-1, :]  # .contiguous()
             shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][
                 :, 1:
