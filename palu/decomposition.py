@@ -266,6 +266,7 @@ def compress_model_svd(model, args, selection_result):
     setattr(model.config, "group_size", group_size) # number of heads in each Palu G-LDR group
     setattr(model.config, "num_groups", num_groups) # number of Palu G-LDR groups
     setattr(model.config, "v_fusion", args.v_fusion)
+    setattr(model.config, "rope_latent", False)  # Disable RoPE in latent space for now
     setattr(model.config, "head_wise_ranks", selection_result)
 
     # Replace each attention layer
@@ -283,6 +284,6 @@ def compress_model(model, tokenizer, args, dev, selection_result):
     elif args.decompose_method == "svd":
         compress_model_svd(model, args, selection_result)
     # elif args.decompose_method == "rope_svd":
-        compress_model_rope_svd(model, selection_result)
+        # compress_model_rope_svd(model, selection_result)
     else:
         raise ValueError(f"Decomposition method {args.decompose_method} is not supported.")

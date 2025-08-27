@@ -72,6 +72,12 @@ def dump_to_huggingface_repos(model, tokenizer, save_path, args):
             
     config["original_model_name_or_path"] = model.config._name_or_path
     
+    # Save Palu-specific configurations
+    if hasattr(model.config, 'rope_latent'):
+        config['rope_latent'] = model.config.rope_latent
+    if hasattr(model.config, 'v_fusion'):
+        config['v_fusion'] = model.config.v_fusion
+    
     import json
 
     json.dump(config, open(save_path + "/config.json", "w"), indent=2)
