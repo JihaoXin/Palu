@@ -206,41 +206,6 @@ def get_whiten_scale_matrix(model, tokenizer, args, dev):
         logger.info(f"Save the whiten scale matrix dict to:  {cache_file}")
 
 def compress_model_whiten(model, tokenizer, args, dev, selection_result):
-    logger.info("Compressing model with whiten decomposition...")
-    # NOTE(brian1009): Prepare whiten scaling matrix
-    get_whiten_scale_matrix(model, tokenizer, args, dev)
-    # Compress the model
-    module_dict = {name: module for name, module in model.named_modules()}
-    full_name_dict = {module: name for name, module in model.named_modules()}
-    linear_info = {}
-    modules = [model]
-    while len(modules) > 0:
-        submodule = modules.pop()
-        for name, raw_linear in submodule.named_children():
-            if isinstance(raw_linear, nn.Linear):
-                full_name = full_name_dict[raw_linear]
-                linear_info[raw_linear] = {
-                    "father": submodule,
-                    "name": name,
-                    "full_name": full_name,
-                }
-            else:
-                modules.append(raw_linear)
-
-    logger.info(f"Start decompose the layer with selected ranks... #target layers: {len(selection_result.keys())}")
-    for layername, selected_head_rank in tqdm(selection_result.items()):
-        logger.debug(f"Decompose {layername} with ranks: {selected_head_rank}")
-        # set ratio
-        raw_linear = module_dict[layername]
-        info = linear_info[raw_linear]
-    
-        head_wise_svd_linear = HeadwiseLowRankModule.from_linear_whiten(
-            raw_linear,
-            selected_head_rank
-        )
-        setattr(info["father"], info["name"],  head_wise_svd_linear)
-
-def compress_model_whiten(model, tokenizer, args, dev, selection_result):
     """Replace LlamaAttention with LlamaPaluAttention using ranks from selection_result."""
     # Set global config only once (using first layer as reference)
     get_whiten_scale_matrix(model, tokenizer, args, dev)
