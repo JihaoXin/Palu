@@ -11,8 +11,6 @@ from types import SimpleNamespace
 from typing import Optional, Union, List, Tuple
 from .configuration_palu_llama import PaluLlamaConfig
 from ..modules.svd_linear import HeadwiseLowRankModule
-from kernel.palu_attention import LlamaPaluAttention
-
 class PaluLlamaForCausalLM(LlamaForCausalLM):
     config_class = PaluLlamaConfig
     def __init__(self, config:PaluLlamaConfig):
@@ -36,6 +34,8 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
                     modules.append(raw_linear)
 
         # Replace attention layer
+        # Import here to avoid circular import
+        from kernel.palu_attention import LlamaPaluAttention
         for i, layer in enumerate(self.model.layers):
             layer.self_attn = LlamaPaluAttention(config, layer_idx=i)
 
