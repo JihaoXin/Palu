@@ -27,8 +27,8 @@ def trace_handler(prof: torch.profiler.profile, file_postfix="prefilling", devic
    prof.export_memory_timeline(f"{file_prefix}_{file_postfix}.html", device=device)
 
 def build_attention(args):
-    device = "cuda:0"
-    dtype = torch.float16
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     logging.info(f"Creating Attention, dtype: {dtype}, device: {device}")
     config = LlamaConfig()
@@ -38,8 +38,8 @@ def build_attention(args):
     return attention, config
 
 def build_attention_palu(args):
-    device = "cuda:0"
-    dtype = torch.float16
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     logging.info(f"Creating Attention_Palu, dtype: {dtype}, device: {device}")
     config = LlamaConfig()
@@ -48,7 +48,23 @@ def build_attention_palu(args):
     config.num_groups = config.num_attention_heads // args.group_size
     config.total_rank_k = args.rank_k
     config.total_rank_v = args.rank_v
+    
+    # Set up head_wise_ranks for layer 0
+    group_rank_k = args.rank_k // config.num_groups  # rank per group for K
+    group_rank_v = args.rank_v // config.num_groups  # rank per group for V
+    config.head_wise_ranks = {
+        "model.layers.0.self_attn.k_proj": [group_rank_k] * config.num_groups,
+        "model.layers.0.self_attn.v_proj": [group_rank_v] * config.num_groups,
+    }
+    
+    # Set flags
+    config.decompose_method = "svd"
+    config.rope_latent = False
+    config.v_fusion = False
+    
     logging.info(f"rank_k: {config.total_rank_k}, rank_v: {config.total_rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
+    logging.info(f"group_rank_k: {group_rank_k}, group_rank_v: {group_rank_v}")
+    
     attention = LlamaAttention(config, layer_idx=0)
     attention_palu = LlamaPaluAttention.from_attention(attention, config).to(device, dtype)
     
@@ -64,21 +80,27 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
     past_key_value = DynamicCache()
     past_key_value.update(cache_k, cache_v, 0)
     
-    position_ids = torch.arange(prompt_len, prompt_len+1)
+    position_ids = torch.arange(prompt_len, prompt_len+1).unsqueeze(0).to(device)
 
     hidden_dim = model.config.hidden_size
-    input_token = torch.randn((batch_size, 1, hidden_dim), dtype=torch.float16, device=device) # only input 1 token at a time
+    input_token = torch.randn((batch_size, 1, hidden_dim), dtype=cache_type, device=device) # only input 1 token at a time
 
     # warmup
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.no_grad():
-        with torch.cuda.stream(s):
-            for _ in range(25):
+    if device.type == 'cuda':
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.no_grad():
+            with torch.cuda.stream(s):
+                for _ in range(25):
+                    _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+        torch.cuda.current_stream().wait_stream(s)
+    else:
+        # CPU warmup
+        with torch.no_grad():
+            for _ in range(5):  # Fewer warmup iterations for CPU
                 _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
-    torch.cuda.current_stream().wait_stream(s)
 
-    if cache_graph:
+    if cache_graph and device.type == 'cuda':
         with torch.no_grad():
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -93,16 +115,25 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
             out = model(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
             return out
 
-    new_input_token = torch.randn((batch_size, 1, hidden_dim), dtype=torch.float16, device=device) # only input 1 token at a time
+    new_input_token = torch.randn((batch_size, 1, hidden_dim), dtype=cache_type, device=device) # only input 1 token at a time
     with torch.no_grad():
-        start = torch.cuda.Event(enable_timing=True) 
-        end   = torch.cuda.Event(enable_timing=True) 
-        start.record()
-        for _ in range(repeats):
-            generate(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
-        end.record()
-        torch.cuda.synchronize()
-    dur = start.elapsed_time(end)
+        if device.type == 'cuda':
+            start = torch.cuda.Event(enable_timing=True) 
+            end   = torch.cuda.Event(enable_timing=True) 
+            start.record()
+            for _ in range(repeats):
+                generate(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
+            end.record()
+            torch.cuda.synchronize()
+            dur = start.elapsed_time(end)
+        else:
+            # CPU timing
+            import time
+            start_time = time.time()
+            for _ in range(repeats):
+                generate(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
+            end_time = time.time()
+            dur = (end_time - start_time) * 1000  # Convert to milliseconds
     logging.info(f"Finished, prompt_len: {prompt_len}, latency: {dur/repeats:.2f} milliseconds (cache_graph={cache_graph})")
 
     if torch_profile:
@@ -145,11 +176,12 @@ def main(args):
     else:
         attention, config = build_attention(args)
         attention.eval()
+        dtype = next(iter(attention.parameters())).dtype
 
         num_heads = config.num_attention_heads
         head_dim = config.hidden_size // num_heads
         cache_size = (bs, num_heads, args.prompt_len, head_dim)
-        profile_tpot(attention, cache_size, cache_size, torch.float16, bs, args.prompt_len, args.repeats, args.cache_graph, args.torch_profile, "tpot_fp16")
+        profile_tpot(attention, cache_size, cache_size, dtype, bs, args.prompt_len, args.repeats, args.cache_graph, args.torch_profile, "tpot_fp16")
     
 
 if __name__ =='__main__':    
