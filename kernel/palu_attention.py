@@ -179,14 +179,15 @@ class LlamaPaluAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
         # K projection
-        if self.rope_latent: # RoPE in latent space: RoPE(x@U)@V
+        if not self.rope_latent: # Standard RoPE(x@U@V)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else: # RoPE in latent space: RoPE(x@U)@V
             key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U
             key_latents_rope = self._apply_rope_to_latents(key_latents, cos, sin)  # RoPE(x@U)
             query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
             key_states = self.k_proj.reconstruct(key_latents_rope).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
-        else: # Standard RoPE(x@U@V)
-            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
         # V projection (standard for now)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
@@ -200,7 +201,7 @@ class LlamaPaluAttention(LlamaAttention):
             batch_size, seq_len = key_latents.shape[:2]
             key_latents_4d = key_latents.view(batch_size, seq_len, self.num_groups, -1).transpose(1, 2)  # [batch, groups, seq, group_rank_k]
             value_latents_4d = value_latents.view(batch_size, seq_len, self.num_groups, -1).transpose(1, 2)    # [batch, groups, seq, group_rank_v]
-            # Cache the latent states - much more memory efficient!
+            # Cache the latent states
             cached_key_latents_4d, cached_value_latents_4d = past_key_value.update(
                 key_latents_4d, value_latents_4d, self.layer_idx, cache_kwargs
             )
