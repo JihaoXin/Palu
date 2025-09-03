@@ -167,17 +167,12 @@ class LlamaPaluAttention(LlamaAttention):
         """
         Forward with conditional RoPE in latent space support
         """
-        if not hasattr(self, '_printed_once'):
-            print("😄😄😄😄😄😄😄😄😄😄😄layer {}: Using PaluAttention. RoPE Latent: {}".format(self.layer_idx, self.rope_latent))
-            self._printed_once = True
-        if not hasattr(self, 'rotary_emb'):
-            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-            self.rotary_emb = LlamaRotaryEmbedding(config=self.config).to(hidden_states.device)
+        logging.debug(f"😄😄😄😄😄😄😄😄😄😄😄Palu Attention layer {self.layer_idx}. RoPE Latent: {self.rope_latent}")
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         # Q projection
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        cos, sin = self.rotary_emb(query_states, position_ids=position_ids)
+        cos, sin = position_embeddings
         # K projection
         if not self.rope_latent: # Standard RoPE(x@U@V)
             key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)

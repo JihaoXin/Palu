@@ -16,7 +16,6 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config:PaluLlamaConfig):
         super().__init__(config)
         self.head_wise_ranks=config.head_wise_ranks
-
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
         modules = [self]
