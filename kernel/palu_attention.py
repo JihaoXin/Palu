@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from transformers.models.llama.modeling_llama import (
-    Cache, apply_rotary_pos_emb, 
+    Cache, 
     LlamaAttention, LlamaConfig,
 )
 
@@ -14,6 +14,40 @@ from transformers.models.llama.modeling_llama import (
 from palu.model.modules.svd_linear import HeadwiseLowRankModule
 
 from .abx_rope import abx as recompute_k_gemv
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin) if q is not None else None
+    k_embed = (k * cos) + (rotate_half(k) * sin) if k is not None else None
+    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -167,31 +201,30 @@ class LlamaPaluAttention(LlamaAttention):
         """
         Forward with conditional RoPE in latent space support
         """
-        logging.debug(f"😄😄😄😄😄😄😄😄😄😄😄Palu Attention layer {self.layer_idx}. RoPE Latent: {self.rope_latent}")
+        self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using HACK Attention layer.")
+        self.print_once("position_embeddings", f"😄😄😄😄😄😄😄😄😄😄😄 RoPE Latent: {self.rope_latent}")
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        cos, sin = position_embeddings
         # Q projection
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        cos, sin = position_embeddings
+        query_states, _ = apply_rotary_pos_emb(query_states, None, cos, sin)
         # K projection
-        if not self.rope_latent: # Standard RoPE(x@U@V)
-            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        else: # RoPE in latent space: RoPE(x@U)@V
-            key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U
+        key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_k]
+        if self.rope_latent: # RoPE in latent space: RoPE(x@U)@V
             key_latents_rope = self._apply_rope_to_latents(key_latents, cos, sin)  # RoPE(x@U)
-            query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
             key_states = self.k_proj.reconstruct(key_latents_rope).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
-
-        # V projection (standard for now)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        else: # RoPE in original space: RoPE(x@U@V)
+            key_states = self.k_proj.reconstruct(key_latents).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
+            _, key_states = apply_rotary_pos_emb(None, key_states, cos, sin)
+        # V projection
+        value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]   
+        value_states = self.v_proj.reconstruct(value_latents).view(hidden_shape).transpose(1, 2)
 
         if past_key_value is not None:
+            self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache")
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # Cache latent space instead of full states for memory efficiency
-            key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_k]
-            value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]
             # Reshape latents to 4D format for caching: [batch, groups, seq, group_rank]
             batch_size, seq_len = key_latents.shape[:2]
             key_latents_4d = key_latents.view(batch_size, seq_len, self.num_groups, -1).transpose(1, 2)  # [batch, groups, seq, group_rank_k]
@@ -237,6 +270,12 @@ class LlamaPaluAttention(LlamaAttention):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     
+    def print_once(self, key: str, msg: str):
+        flag = f"__printed_once_{key}"
+        if self.layer_idx == 0 and not hasattr(self, flag):
+            print(msg)
+            setattr(self, flag, True)
+
     def _apply_rope_to_latents(self, latents: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """
         Apply RoPE to grouped latent states - simplified version
