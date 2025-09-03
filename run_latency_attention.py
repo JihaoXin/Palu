@@ -10,6 +10,7 @@ from datetime import datetime
 
 from transformers.models.llama.modeling_llama import LlamaConfig, DynamicCache, LlamaAttention
 from kernel.palu_attention import LlamaPaluAttention
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
 
@@ -84,7 +85,8 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
 
     hidden_dim = model.config.hidden_size
     input_token = torch.randn((batch_size, 1, hidden_dim), dtype=cache_type, device=device) # only input 1 token at a time
-
+    rotary_emb = LlamaRotaryEmbedding(config=model.config).to(device)
+    position_embeddings = rotary_emb(input_token, position_ids)
     # warmup
     if device.type == 'cuda':
         s = torch.cuda.Stream()
@@ -92,19 +94,21 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
         with torch.no_grad():
             with torch.cuda.stream(s):
                 for _ in range(25):
-                    _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+                    _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids, position_embeddings=position_embeddings)
         torch.cuda.current_stream().wait_stream(s)
     else:
         # CPU warmup
         with torch.no_grad():
             for _ in range(5):  # Fewer warmup iterations for CPU
-                _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+                _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids, position_embeddings=position_embeddings)
 
     if cache_graph and device.type == 'cuda':
         with torch.no_grad():
+            # Pre-compute position_embeddings for graph capture
+            graph_position_embeddings = rotary_emb(input_token, position_ids)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+                out = model(input_token, past_key_value=past_key_value, position_ids=position_ids, position_embeddings=graph_position_embeddings)
             
         def generate(new_input_token, past_key_value, position_ids):
             input_token.copy_(new_input_token)
@@ -112,7 +116,8 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
             return out
     else:
         def generate(new_input_token, past_key_value, position_ids):
-            out = model(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
+            position_embeddings = rotary_emb(new_input_token, position_ids)
+            out = model(new_input_token, past_key_value=past_key_value, position_ids=position_ids, position_embeddings=position_embeddings)
             return out
 
     new_input_token = torch.randn((batch_size, 1, hidden_dim), dtype=cache_type, device=device) # only input 1 token at a time
