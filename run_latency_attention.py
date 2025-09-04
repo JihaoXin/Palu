@@ -175,8 +175,6 @@ def main(args):
         # NOTE: Assuming uniform head_dim
         group_dim_k = config.total_rank_k // config.num_groups 
         group_dim_v = config.total_rank_v // config.num_groups 
-        # cache_size_k = (bs, num_groups, args.prompt_len, group_dim_k)
-        # cache_size_v = (bs, num_groups, args.prompt_len, group_dim_v)
         cache_size_k = (bs, args.prompt_len, num_groups, group_dim_k)  # [batch, seq, groups, group_dim]
         cache_size_v = (bs, args.prompt_len, num_groups, group_dim_v)  # [batch, seq, groups, group_dim]
         profile_tpot(attention, cache_size_k, cache_size_v, torch.float16, bs, args.prompt_len, args.repeats, args.cache_graph, args.torch_profile, "tpot_palu_fp16")

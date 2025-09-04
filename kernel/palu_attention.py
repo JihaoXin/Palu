@@ -37,7 +37,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin) if k is not None else None
     return q_embed, k_embed
 
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -189,52 +188,67 @@ class LlamaPaluAttention(LlamaAttention):
         """
         Forward with conditional RoPE in latent space support
         """
-        self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using HACK Attention layer.")
-        self.print_once("position_embeddings", f"😄😄😄😄😄😄😄😄😄😄😄 RoPE Latent: {self.rope_latent}")
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
         batch_size, seq_len = hidden_states.shape[:2]
-        #---------------------PALU Approach------------------------------------
-        # RoPE(x@U@V) where we cache x@U, then reconstruct x@U@V on the fly
-        # Q projection
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        # K/V down projection
-        key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_k]
-        value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]
-        # KV up projection
-        if past_key_value is None:
-            self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄No KV Cache")
-            key_states = self.k_proj.reconstruct(key_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = self.v_proj.reconstruct(value_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        elif past_key_value is not None: 
-            self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache;")
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_latents_to_cache = key_latents.view(batch_size, seq_len, self.num_groups, -1)  # [batch, seq, groups, group_rank_k]
-            value_latents_to_cache = value_latents.view(batch_size, seq_len, self.num_groups, -1)    # [batch, seq, groups, group_rank_v]
-            cached_key_latents, cached_value_latents = past_key_value.update(key_latents_to_cache, value_latents_to_cache, self.layer_idx, cache_kwargs)
-            key_states = self.k_proj.reconstruct(cached_key_latents.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = self.v_proj.reconstruct(cached_value_latents.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            # Apply RoPE 
+        ###---------------------PALU Approach------------------------------------###
+        if not self.rope_latent:### RoPE(x@U@V) where we cache x@U, then reconstruct x@U@V on the fly
+            self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using PALU Attention layer.")
+            # Q projection
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            # K/V down projection
+            key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_k]
+            value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]
+            # KV up projection
+            if past_key_value is None:
+                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄No KV Cache")
+                key_states = self.k_proj.reconstruct(key_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                value_states = self.v_proj.reconstruct(value_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            elif past_key_value is not None: 
+                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache;")
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_latents_to_cache = key_latents.view(batch_size, seq_len, self.num_groups, -1)  # [batch, seq, groups, group_rank_k]
+                value_latents_to_cache = value_latents.view(batch_size, seq_len, self.num_groups, -1)    # [batch, seq, groups, group_rank_v]
+                cached_key_latents, cached_value_latents = past_key_value.update(key_latents_to_cache, value_latents_to_cache, self.layer_idx, cache_kwargs)
+                key_states = self.k_proj.reconstruct(cached_key_latents.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                value_states = self.v_proj.reconstruct(cached_value_latents.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                # Apply RoPE 
+                query_states, _ = apply_rotary_pos_emb(query_states, None, cos, sin)
+                if not hasattr(self, '_full_rotary_emb'):
+                    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                    self._full_rotary_emb = LlamaRotaryEmbedding(config=self.config).to(key_states.device)
+                full_rotary_emb = self._full_rotary_emb
+                position_ids_full = torch.arange(key_states.shape[2], device=key_states.device).unsqueeze(0)
+                cos_full, sin_full = full_rotary_emb(key_states, position_ids_full)
+                _, key_states = apply_rotary_pos_emb(None, key_states, cos_full, sin_full)
+        ###---------------------HACK Approach------------------------------------###
+        elif self.rope_latent: ### RoPE(x@U)@V where we cache RoPE(x@U)
+            self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using HACK Attention layer.")
+            # Q projection
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
             query_states, _ = apply_rotary_pos_emb(query_states, None, cos, sin)
-            if not hasattr(self, '_full_rotary_emb'):
-                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-                self._full_rotary_emb = LlamaRotaryEmbedding(config=self.config).to(key_states.device)
-            full_rotary_emb = self._full_rotary_emb
-            position_ids_full = torch.arange(key_states.shape[2], device=key_states.device).unsqueeze(0)
-            cos_full, sin_full = full_rotary_emb(key_states, position_ids_full)
-            _, key_states = apply_rotary_pos_emb(None, key_states, cos_full, sin_full)
-
-        # if self.rope_latent: # RoPE in latent space: RoPE(x@U)@V
-        #     key_latents_rope = self._apply_rope_to_latents(key_latents, cos, sin)  # RoPE(x@U)
-        #     key_states = self.k_proj.reconstruct(key_latents_rope).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
-        # else: # RoPE in original space: RoPE(x@U@V)
-        #     key_states = self.k_proj.reconstruct(key_latents).view(hidden_shape).transpose(1, 2)  # RoPE(x@U)@V
-        #     _, key_states = apply_rotary_pos_emb(None, key_states, cos, sin)
-        # # V projection
-        # value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]   
-        # value_states = self.v_proj.reconstruct(value_latents).view(hidden_shape).transpose(1, 2)
+            # K/V down projection
+            key_latents = self.k_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_k]
+            latent_dim = key_latents.shape[-1] // self.num_key_value_heads
+            key_latents = key_latents.view(batch_size, seq_len, self.num_key_value_heads, latent_dim).transpose(1, 2) # [batch, heads, seq, latent_dim]
+            _, key_latents_rope = apply_rotary_pos_emb(None, key_latents, cos[..., :latent_dim], sin[..., :latent_dim])  # [batch, heads, seq, latent_dim]
+            key_latents_rope = key_latents_rope.transpose(1, 2).reshape(batch_size, seq_len, -1) # [batch, seq, total_latent_k]
+            value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]
+            # K/V up projection
+            if past_key_value is None:
+                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄No KV Cache")
+                key_states = self.k_proj.reconstruct(key_latents_rope).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                value_states = self.v_proj.reconstruct(value_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            elif past_key_value is not None: 
+                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache;")
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_latents_to_cache = key_latents_rope.view(batch_size, seq_len, self.num_groups, -1)  # [batch, seq, groups, group_rank_k]
+                value_latents_to_cache = value_latents.view(batch_size, seq_len, self.num_groups, -1)    # [batch, seq, groups, group_rank_v]
+                cached_key_latents_rope, cached_value_latents = past_key_value.update(key_latents_to_cache, value_latents_to_cache, self.layer_idx, cache_kwargs)
+                key_states = self.k_proj.reconstruct(cached_key_latents_rope.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                value_states = self.v_proj.reconstruct(cached_value_latents.view(batch_size, seq_len, -1)).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
 
         attention_interface: Callable = eager_attention_forward
@@ -270,48 +284,7 @@ class LlamaPaluAttention(LlamaAttention):
             print(msg)
             setattr(self, flag, True)
 
-    def _apply_rope_to_latents(self, latents: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """
-        Apply RoPE to grouped latent states - simplified version
-        
-        Args:
-            latents: [batch, seq_len, total_latent_dim] 
-            cos, sin: RoPE embeddings [batch, seq_len, head_dim]
-            
-        Returns:
-            latents_rope: [batch, seq_len, total_latent_dim]
-        """
-        batch_size, seq_len, total_latent_dim = latents.shape
-        
-        # For simplicity, apply RoPE only to the first head_dim dimensions of the latents
-        # This is a reasonable approximation for the RoPE(x@U)@V approach
-        rope_dim = min(total_latent_dim, self.head_dim)
-        
-        if rope_dim == total_latent_dim:
-            # All dimensions get RoPE
-            # Reshape to [batch, 1, seq_len, total_latent_dim] for apply_rotary_pos_emb
-            latents_reshaped = latents.unsqueeze(1)  # [batch, 1, seq_len, total_latent_dim]
-            cos_truncated = cos[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
-            sin_truncated = sin[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
-            
-            latents_rope, _ = apply_rotary_pos_emb(latents_reshaped, latents_reshaped, cos_truncated, sin_truncated)
-            return latents_rope.squeeze(1)
-        else:
-            # Split into RoPE part and non-RoPE part
-            rope_part = latents[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
-            non_rope_part = latents[:, :, rope_dim:]  # [batch, seq_len, remaining_dim]
-            
-            # Apply RoPE to rope_part
-            rope_part_reshaped = rope_part.unsqueeze(1)  # [batch, 1, seq_len, rope_dim]
-            cos_truncated = cos[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
-            sin_truncated = sin[:, :, :rope_dim]  # [batch, seq_len, rope_dim]
-            
-            rope_part_rotated, _ = apply_rotary_pos_emb(rope_part_reshaped, rope_part_reshaped, cos_truncated, sin_truncated)
-            rope_part_rotated = rope_part_rotated.squeeze(1)  # [batch, seq_len, rope_dim]
-            
-            # Concatenate back
-            latents_rope = torch.cat([rope_part_rotated, non_rope_part], dim=-1)
-            return latents_rope
+
 
     # def forward(
     #     self,
