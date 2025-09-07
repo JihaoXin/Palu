@@ -194,7 +194,7 @@ class LlamaPaluAttention(LlamaAttention):
         batch_size, seq_len = hidden_states.shape[:2]
         ###---------------------PALU Approach------------------------------------###
         if not self.rope_latent:### RoPE(x@U@V) where we cache x@U, then reconstruct x@U@V on the fly
-            self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using PALU Attention layer.")
+            # self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using PALU Attention layer.")
             # Q projection
             query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
             # K/V down projection
@@ -225,7 +225,7 @@ class LlamaPaluAttention(LlamaAttention):
                 _, key_states = apply_rotary_pos_emb(None, key_states, cos_full, sin_full)
         ###---------------------HACK Approach------------------------------------###
         elif self.rope_latent: ### RoPE(x@U)@V where we cache RoPE(x@U)
-            self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using HACK Attention layer.")
+            # self.print_once("rope_latent", f"😄😄😄😄😄😄😄😄😄😄😄Using HACK Attention layer.")
             # Q projection
             query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
             query_states, _ = apply_rotary_pos_emb(query_states, None, cos, sin)
