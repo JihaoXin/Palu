@@ -1,9 +1,8 @@
 # Palu/Hack 单层对齐与评测说明
 
-本文档介绍三个脚本及其使用方式：
-- run_ppl_svd_finetune.py：单层隔离微调并注入整模型评测 PPL（直接PPL优化）
-- test_rope_alignment_vt_u_real.py：在真实模型上验证 VT+U 同时优化的可行性（层内对齐实验）
-- test_rope_alignment_vt_u.py：合成数据上验证 VT+U 同时优化（数学可行性实验）
+本文档介绍两个脚本及其使用方式：
+- run_ppl_svd_finetune_fixed.py：单层隔离微调并注入整模型评测 PPL（直接PPL优化）
+- test_rope_alignment_vt_u_real.py：在真实模型上验证 VT+U 同时优化的可行性（层内对齐实验，支持可视化和增强优化）
 
 ## 一、背景与术语
 - PALU Attention：RoPE(x@U@V)。
@@ -56,22 +55,22 @@ python run_ppl_svd_finetune.py \
 ### 2) test_rope_alignment_vt_u_real.py
 - 从真实模型 hook 指定层的 `hidden_states`，在该层上进行 VT+U 同时优化（PALU 作为目标，拟合 HACK），
 - 仅层内实验（不注入全模型），用于观察相对误差和参数变化。
+- **新增功能**：支持可视化训练过程、consistency loss增强优化、结果保存等。
+
+关键参数：
+- `--visualize`：生成训练过程的可视化图表
+- `--no_consistency_loss`：禁用consistency loss（默认启用）
+- `--save_results`：保存详细结果到JSON文件
+- `--save_aligned`：保存对齐后的权重
 
 示例：
 ```bash
 python test_rope_alignment_vt_u_real.py \
   --model_path Meta-Llama-3-8B-Instruct_ratio-0.7_gs-4-fisher_uniform-svd \
   --layer_idx 0 --batch_size 8 --seq_len 128 --num_steps 2000 \
-  --save_aligned
+  --save_aligned --visualize --save_results
 ```
 
-### 3) test_rope_alignment_vt_u.py
-- 合成数据下，验证 VT+U 同时优化能否使 HACK 逼近 PALU（数学可行性）。
-
-示例：
-```bash
-python test_rope_alignment_vt_u.py --batch_size 8 --seq_len 128 --num_steps 3000 --device cuda
-```
 
 ## 三、当前状态概述
 - 已支持：
@@ -80,7 +79,9 @@ python test_rope_alignment_vt_u.py --batch_size 8 --seq_len 128 --num_steps 3000
   - 隔离训练模式：在GPU上进行端到端训练，避免内存问题。
   - 评测时可设置仅第 k 层 HACK，其余 PALU；prefill-only 评测。
   - 稳定的数据类型（float32）、finite 检查、梯度裁剪、微批累加、正则化。
+  - **增强的层内对齐实验**：支持可视化、consistency loss、结果保存等高级功能。
 - 优势：
   - 直接优化目标指标（PPL），避免中间对齐的语义损失。
   - 支持多组件联合训练，提高优化效果。
   - 简化的训练流程，减少调试复杂度。
+  - **丰富的实验分析工具**：可视化训练过程、权重变化跟踪、详细结果保存。
