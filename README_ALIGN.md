@@ -37,7 +37,7 @@
 推荐命令：
 ```bash
 ATTN_DTYPE=float32 MBS=2 \
-python run_ppl_svd_finetune.py \
+python run_ppl_svd_finetune_fixed.py \
   --model_path Meta-Llama-3-8B-Instruct_ratio-0.7_gs-4-fisher_uniform-svd \
   --layer_idx 0 --num_steps 10000 --batch_size 8 --seq_len 128 --lr 5e-4 \
   --dataset wikitext2 --seqlen 2048 \

@@ -40,13 +40,13 @@ def apply_rotary_pos_emb_helper(q: torch.Tensor, k: torch.Tensor, cos: torch.Ten
     return q_embed, k_embed
 
 
-def capture_hidden_states(model, tokenizer, device: str, layer_idx: int, batch_size: int, seq_len: int, split: str = "test") -> torch.Tensor:
+def capture_hidden_states(model, tokenizer, device: str, layer_idx: int, batch_size: int, seq_len: int, split: str = "test", num_samples: int = 1000) -> torch.Tensor:
     """Run one forward pass on wikitext2 to capture the input hidden_states of the target self_attn layer.
-    split: "train" or "test"
+    split: "train" or "test"; num_samples controls how many examples to concatenate.
     """
-    # Prepare a small batch from wikitext2
+    # Prepare a batch from wikitext2 (use more samples for better coverage)
     ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
-    text = "\n\n".join(ds[:200]["text"])  # small slice
+    text = "\n\n".join(ds[:num_samples]["text"])  # larger slice
     toks = tokenizer(text, return_tensors="pt")
     flat_ids = toks.input_ids.squeeze(0)
     total_needed = batch_size * seq_len
@@ -101,13 +101,15 @@ def evaluate_on_hidden_states(model, layer_idx: int, hidden_states: torch.Tensor
     attn: LlamaPaluAttention = model.model.layers[layer_idx].self_attn  # type: ignore
     k_proj = attn.k_proj
 
-    hidden_states = hidden_states.to(torch.float32)
+    # Match input dtype to projection weights to avoid Linear dtype mismatch
+    proj_dtype = k_proj.VT.weight.dtype
+    hidden_states = hidden_states.to(proj_dtype)
     seq_len = hidden_states.shape[1]
 
     rotary_emb = LlamaRotaryEmbedding(config=attn.config).to(device)
     cos, sin = rotary_emb(hidden_states, torch.arange(seq_len, device=device).unsqueeze(0))
-    cos = cos.to(torch.float32)
-    sin = sin.to(torch.float32)
+    cos = cos.to(proj_dtype)
+    sin = sin.to(proj_dtype)
 
     with torch.no_grad():
         # Target
@@ -127,6 +129,7 @@ def evaluate_on_hidden_states(model, layer_idx: int, hidden_states: torch.Tensor
         lat_rope_3d = lat_rope.transpose(1, 2).reshape(hidden_states.shape[0], seq_len, -1)
         hack = k_proj.reconstruct(lat_rope_3d)
         hack_4d = hack.view(hidden_states.shape[0], seq_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+        hack_4d = hack_4d.to(torch.float32)
 
         mse = nn.functional.mse_loss(hack_4d, target)
         rel = (mse / var_target).item()
@@ -397,28 +400,42 @@ def main():
     if not isinstance(attn, LlamaPaluAttention):
         raise TypeError(f"Layer {args.layer_idx} self_attn is not LlamaPaluAttention: {type(attn)}")
 
-    # Capture train hidden_states for alignment
-    train_hidden_states = capture_hidden_states(model, tokenizer, args.device, args.layer_idx, args.batch_size, args.seq_len, split=args.train_split)
+    # Capture train hidden_states for alignment (use more samples)
+    train_hidden_states = capture_hidden_states(
+        model, tokenizer, args.device, args.layer_idx,
+        args.batch_size, args.seq_len, split=args.train_split, num_samples=2000
+    )
 
     # Dump current VT/U
     dump_dir = Path(args.dump_dir)
     dump_decomposed_weights(attn.k_proj, dump_dir, args.layer_idx)
+
+    # Evaluate on eval split BEFORE alignment
+    eval_hidden_states = capture_hidden_states(
+        model, tokenizer, args.device, args.layer_idx,
+        args.batch_size, args.seq_len, split=args.eval_split, num_samples=2000
+    )
+    eval_rel_before = evaluate_on_hidden_states(model, args.layer_idx, eval_hidden_states)
 
     # Run alignment on train
     save_dir = dump_dir if args.save_aligned else None
     use_consistency = not args.no_consistency_loss
     summary = vt_u_alignment_on_real(model, args.layer_idx, train_hidden_states, args.num_steps, save_dir, use_consistency)
 
-    # Evaluate on eval split (test)
-    eval_hidden_states = capture_hidden_states(model, tokenizer, args.device, args.layer_idx, args.batch_size, args.seq_len, split=args.eval_split)
-    eval_rel = evaluate_on_hidden_states(model, args.layer_idx, eval_hidden_states)
+    # Evaluate on eval split (test) AFTER alignment
+    eval_hidden_states = capture_hidden_states(
+        model, tokenizer, args.device, args.layer_idx,
+        args.batch_size, args.seq_len, split=args.eval_split, num_samples=2000
+    )
+    eval_rel_after = evaluate_on_hidden_states(model, args.layer_idx, eval_hidden_states)
 
     print("\n=== Alignment Summary (Real Weights) ===")
     print(f"Layer: {args.layer_idx}")
     print(f"Consistency Loss: {'Enabled' if use_consistency else 'Disabled'}")
     print(f"Train Final MSE: {summary['final_mse']:.6f}")
     print(f"Train Final Relative Error: {summary['final_relative_error']*100:.3f}%")
-    print(f"Eval Relative Error: {eval_rel*100:.3f}%")
+    print(f"Eval Relative Error (before): {eval_rel_before*100:.3f}%")
+    print(f"Eval Relative Error (after):  {eval_rel_after*100:.3f}%")
     print(f"VT change: {summary['vt_change']:.4f}")
     print(f"U changes (avg): {sum(summary['u_changes'])/len(summary['u_changes']):.4f}")
 
@@ -439,7 +456,7 @@ def main():
                 'batch_size': args.batch_size,
                 'seq_len': args.seq_len,
                 'use_consistency_loss': use_consistency,
-                'eval_relative_error': float(eval_rel)
+                'eval_relative_error': float(eval_rel_after)
             }
             json.dump(save_data, f, indent=2)
         print(f"\nDetailed results saved to: {results_file}")
