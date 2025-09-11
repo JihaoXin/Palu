@@ -202,12 +202,12 @@ class LlamaPaluAttention(LlamaAttention):
             value_latents = self.v_proj.project_to_latent(hidden_states)  # x@U: [batch, seq, total_latent_v]
             # KV up projection
             if past_key_value is None:
-                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄No KV Cache")
+                # self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄No KV Cache")
                 key_states = self.k_proj.reconstruct(key_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
                 value_states = self.v_proj.reconstruct(value_latents).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
                 query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
             elif past_key_value is not None: 
-                self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache;")
+                # self.print_once("past_key_value", f"😄😄😄😄😄😄😄😄😄😄😄Using KV Cache;")
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_latents_to_cache = key_latents.view(batch_size, seq_len, self.num_groups, -1)  # [batch, seq, groups, group_rank_k]
                 value_latents_to_cache = value_latents.view(batch_size, seq_len, self.num_groups, -1)    # [batch, seq, groups, group_rank_v]
