@@ -46,6 +46,26 @@ class StructuredPrunedLinear(nn.Module):
     def finetune_parameters(self):
         return [self.post.weight]
 
+    @classmethod
+    def from_dumped(cls, original_linear: nn.Linear, state_dict: dict[str, torch.Tensor], prefix: str):
+        """Reconstruct a StructuredPrunedLinear from a saved state_dict entry."""
+        weight_key = f"{prefix}core.weight"
+        bias_key = f"{prefix}core.bias"
+        if weight_key not in state_dict:
+            raise KeyError(f"state_dict 中缺少 {weight_key}，无法恢复结构化线性层")
+
+        latent_dim = state_dict[weight_key].shape[0]
+        in_features = original_linear.in_features
+        out_features = original_linear.out_features
+        dtype = original_linear.weight.dtype
+        device = original_linear.weight.device
+        has_bias = bias_key in state_dict
+
+        dummy_keep = torch.arange(latent_dim, device=device, dtype=torch.long)
+        core = nn.Linear(in_features, latent_dim, bias=has_bias, dtype=dtype, device=device)
+        post = nn.Linear(latent_dim, out_features, bias=False, dtype=dtype, device=device)
+        return cls(core, post, dummy_keep)
+
 # 超参配置
 MODEL_PATH = "meta-llama/Meta-Llama-3-8B-Instruct"
 DATASET_NAME = "wikitext-2-raw-v1"
@@ -62,8 +82,47 @@ SEQ_LEN = 2048
 BATCH_SIZE = 8
 MAX_TEST_WINDOWS = 10
 
+pruned_hack_layer_ids = list(range(0, 17))
+
+
+def print_meta_info(extra: dict | None = None):
+    print("\n===== Meta Info & Hyperparameters =====")
+    meta_fields = {
+        "MODEL_PATH": MODEL_PATH,
+        "DATASET_NAME": DATASET_NAME,
+        "KEEP_RATIO": KEEP_RATIO,
+        "IMPORTANCE_BATCHES": IMPORTANCE_BATCHES,
+        "IMPORTANCE_BATCH_SIZE": IMPORTANCE_BATCH_SIZE,
+        "IMPORTANCE_SEQ_LEN": IMPORTANCE_SEQ_LEN,
+        "MASK_FINETUNE_STEPS": MASK_FINETUNE_STEPS,
+        "EVAL_EVERY_MASK": EVAL_EVERY_MASK,
+        "MASK_FINETUNE_LR": MASK_FINETUNE_LR,
+        "MASK_LAMBDA_REG": MASK_LAMBDA_REG,
+        "SEQ_LEN": SEQ_LEN,
+        "BATCH_SIZE": BATCH_SIZE,
+        "MAX_TEST_WINDOWS": MAX_TEST_WINDOWS,
+    }
+    if extra:
+        meta_fields.update(extra)
+    for key, value in meta_fields.items():
+        print(f"{key}: {value}")
+    print("=======================================\n")
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+dump_dir = "HACKDump"
+try:
+    os.makedirs(dump_dir, exist_ok=True)
+except OSError as e:
+    print(f"创建 {dump_dir} 目录失败: {e}")
+    dump_dir = None
+
+
+def get_layer_dump_path(layer_id: int) -> str | None:
+    if dump_dir is None:
+        return None
+    return f"{dump_dir}/{MODEL_PATH.split('/')[-1]}_layer{layer_id}_structured.pt"
 
 # %% [markdown]
 #  # 评估函数
@@ -153,6 +212,7 @@ def zero_shot_eval(model, tokenizer, tasks, *,
 #  ## 1) 加载 model 和 dataset
 
 # %%
+print("===== 阶段零：加载模型和数据集 =====")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = AutoModelForCausalLM.from_pretrained(
@@ -164,23 +224,30 @@ if tokenizer.pad_token is None:
 
 print("原始模型已加载。")
 
-hack_layer_ids = list(range(1)) 
+hack_layer_ids = list(range(0,32)) 
 active_hack_layer_id = hack_layer_ids[0] if len(hack_layer_ids) > 0 else 0
+print_meta_info({
+    "device": device,
+    "hack_layer_ids": hack_layer_ids,
+    "active_hack_layer_id": active_hack_layer_id,
+    "pruned_hack_layer_ids": pruned_hack_layer_ids,
+})
 
 original_layers = {lid: copy.deepcopy(model.model.layers[lid].self_attn) for lid in hack_layer_ids}
 print(f"已缓存原始注意力层: {list(original_layers.keys())}")
-
 ds_train = load_dataset("wikitext", DATASET_NAME, split="train")
 ds_test = load_dataset("wikitext", DATASET_NAME, split="test")
 test_texts = [ex["text"] for ex in ds_test if ex["text"].strip()]
 test_text_cat = "\n\n".join(test_texts)
 test_tok = tokenizer(test_text_cat, return_tensors="pt")
 test_ids_all = tokenizer("\n\n".join(ds_test["text"]), return_tensors="pt").input_ids
-print("评估数据已缓存。")
-
 rotary_full = LlamaRotaryEmbedding(config=model.model.layers[0].self_attn.config).to(device=device, dtype=torch.float16)
 
 
+# %% [markdown]
+#  ## 2) 训练/剪枝辅助函数
+
+# %%
 def reset_model(model, original_layers, layer_ids):
     layers = {}
     if isinstance(layer_ids, int):
@@ -191,10 +258,6 @@ def reset_model(model, original_layers, layer_ids):
     print(f"已将第 {layer_ids} 层注意力恢复为原始权重")
     return layers
 
-# %% [markdown]
-#  ## 2) 训练/剪枝辅助函数
-
-# %%
 def sample_batch(tokenizer, batch_size=8, seq_len=128, device=device):
     texts = []
     while len(texts) < batch_size:
@@ -205,7 +268,6 @@ def sample_batch(tokenizer, batch_size=8, seq_len=128, device=device):
         texts, max_length=seq_len, truncation=True, padding="max_length", return_tensors="pt"
     )
     return tok.input_ids.to(device)
-
 
 @torch.no_grad()
 def capture_layer_input_hidden_states(model, input_ids, layer_id, device):
@@ -360,17 +422,39 @@ def alignment_loss(model, input_ids, layer_id, original_attn):
 torch.manual_seed(42)
 np.random.seed(42)
 
-reset_model(model, original_layers, layer_ids=hack_layer_ids)
-
 print("\n===== 阶段一：先对目标层执行结构化剪枝（无微调） =====")
 pruned_layers: dict[int, nn.Module] = {}
 keep_pairs_map: dict[int, list[list[int]]] = {}
 pair_scores_map: dict[int, torch.Tensor] = {}
 
 for layer_id in hack_layer_ids:
-    print(f"\n--> 剪枝第 {layer_id} 层")
+    print(f"--> 剪枝第 {layer_id} 层")
     hack_attn = model.model.layers[layer_id].self_attn
     original_attn = copy.deepcopy(original_layers[layer_id])
+
+    restored_from_dump = False
+    dump_path = get_layer_dump_path(layer_id)
+    if (
+        dump_path is not None
+        and layer_id in pruned_hack_layer_ids
+        and os.path.isfile(dump_path)
+    ):
+        try:
+            saved_state = torch.load(dump_path, map_location="cpu")
+            hack_attn.k_proj = StructuredPrunedLinear.from_dumped(original_attn.k_proj, saved_state, "k_proj.")
+            hack_attn.v_proj = StructuredPrunedLinear.from_dumped(original_attn.v_proj, saved_state, "v_proj.")
+            hack_attn.load_state_dict(saved_state)
+            hack_attn.to(dtype=torch.float16)
+            pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
+            keep_pairs_map[layer_id] = None
+            pair_scores_map[layer_id] = None
+            print(f"检测到第 {layer_id} 层已有裁剪结果，已从 {dump_path} 恢复。")
+            restored_from_dump = True
+        except (OSError, RuntimeError, KeyError) as exc:
+            print(f"加载第 {layer_id} 层裁剪结果失败，将重新计算。原因: {exc}")
+
+    if restored_from_dump:
+        continue
 
     pair_scores = compute_pair_scores(
         model,
@@ -400,9 +484,31 @@ print("\n===== 阶段二：逐层 Masked Finetune =====")
 best_layers: dict[int, nn.Module] = {layer_id: copy.deepcopy(pruned_layers[layer_id]) for layer_id in hack_layer_ids}
 
 for layer_id in hack_layer_ids:
+    print("--------------------------------------------------------------------------------------------------------------------------------")
     print(f"\n--> Finetune 第 {layer_id} 层")
     hack_attn = model.model.layers[layer_id].self_attn
     original_attn = copy.deepcopy(original_layers[layer_id])
+
+    resumed_from_dump = False
+    dump_path = get_layer_dump_path(layer_id)
+    if (
+        layer_id in pruned_hack_layer_ids
+        and dump_path is not None
+        and os.path.isfile(dump_path)
+    ):
+        try:
+            state_dict = torch.load(dump_path, map_location="cpu")
+            hack_attn.load_state_dict(state_dict)
+            hack_attn.to(dtype=torch.float16)
+            model.model.layers[layer_id].self_attn = hack_attn
+            best_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
+            print(f"检测到第 {layer_id} 层已有微调结果，已从 {dump_path} 恢复。")
+            resumed_from_dump = True
+        except (OSError, RuntimeError) as e:
+            print(f"加载第 {layer_id} 层已有权重失败，将重新微调。原因: {e}")
+
+    if resumed_from_dump:
+        continue
 
     loss_hist = []
     ppl_hist = []
@@ -467,8 +573,14 @@ for layer_id in hack_layer_ids:
     best_layers[layer_id] = copy.deepcopy(model.model.layers[layer_id].self_attn)
     layer_final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
     print(f"第 {layer_id} 层微调完成后整体 PPL: {layer_final_ppl:.4f}")
+    dump_path = get_layer_dump_path(layer_id)
+    if dump_path is not None:
+        try:
+            torch.save(best_layers[layer_id].state_dict(), dump_path)
+            print(f"已保存第 {layer_id} 层最优权重到 {dump_path}")
+        except OSError as e:
+            print(f"保存第 {layer_id} 层权重失败: {e}")
     example_generation(model, tokenizer, device)
-    print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
 
 # %% [markdown]
 #  ## 评估 PPL & OpenBookQA
@@ -479,7 +591,7 @@ ppl_original = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_al
 res_original = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
 print(f"👉🏻👉🏻👉🏻👉🏻原始模型: PPL= {ppl_original:.4f}")
 example_generation(model, tokenizer, device)
-print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+print("--------------------------------------------------------------------------------------------------------------------------------")
 
 # 结构化剪枝后（未 finetune）
 for layer_id in hack_layer_ids:
@@ -489,7 +601,7 @@ ppl_pruned = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
 res_pruned = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
 print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 (layer={hack_layer_ids}) 未 finetune: PPL= {ppl_pruned:.4f}")
 example_generation(model, tokenizer, device)
-print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+print("--------------------------------------------------------------------------------------------------------------------------------")
 
 # 结构化剪枝 + masked finetune
 for layer_id in hack_layer_ids:
@@ -499,21 +611,4 @@ final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
 res_pruned_finetune = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
 print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 + masked finetune (layer={hack_layer_ids}): PPL= {final_ppl:.4f}")
 example_generation(model, tokenizer, device)
-print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
-
-# %% [markdown]
-#  ### 保存权重
-
-# %%
-try:
-    os.makedirs("HACKDump", exist_ok=True)
-except OSError as e:
-    print(f"创建 HACKDump 目录失败: {e}")
-
-for layer_id, best_attn in best_layers.items():
-    path = f"HACKDump/{MODEL_PATH.split('/')[-1]}_layer{layer_id}_structured.pt"
-    try:
-        torch.save(best_attn.state_dict(), path)
-        print(f"已保存第 {layer_id} 层最优权重到 {path}")
-    except OSError as e:
-        print(f"保存第 {layer_id} 层权重失败: {e}")
+print("--------------------------------------------------------------------------------------------------------------------------------")
