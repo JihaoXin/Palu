@@ -1,0 +1,519 @@
+# %% [markdown]
+#  # 配置与导入
+
+# %%
+import os
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+from kernel.palu_attention import apply_rotary_pos_emb
+import lm_eval
+from lm_eval.models.huggingface import HFLM
+from lm_eval.tasks import TaskManager
+from lm_eval.utils import make_table
+
+
+class StructuredPrunedLinear(nn.Module):
+    """线性层裁剪后保留核心投影 + 可训练的后处理矩阵（初始为单位阵）。"""
+
+    def __init__(self, core: nn.Linear, post: nn.Linear, keep_indices: torch.Tensor):
+        super().__init__()
+        self.core = core
+        self.post = post
+        self.register_buffer("keep_indices", keep_indices, persistent=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        latent = self.core(hidden_states)
+        return self.post(latent)
+
+    def full_weight(self) -> torch.Tensor:
+        return self.post.weight @ self.core.weight
+
+    def full_bias(self) -> torch.Tensor | None:
+        if self.core.bias is None:
+            return None
+        return self.post.weight @ self.core.bias
+
+    def frozen_parameters(self):
+        return list(self.core.parameters())
+
+    def finetune_parameters(self):
+        return [self.post.weight]
+
+# 超参配置
+MODEL_PATH = "meta-llama/Meta-Llama-3-8B-Instruct"
+DATASET_NAME = "wikitext-2-raw-v1"
+KEEP_RATIO = 0.7                # 每个头仅保留前 KEEP_RATIO 的 RoPE 配对
+IMPORTANCE_BATCHES = 24         # 采样批次数以估计 RoPE pair 重要性
+IMPORTANCE_BATCH_SIZE = 8
+IMPORTANCE_SEQ_LEN = 2048
+MASK_FINETUNE_STEPS = 2000       # 结构化剪枝后可选的 masked finetune steps
+EVAL_EVERY_MASK = 100
+MASK_FINETUNE_LR = 2e-4
+MASK_LAMBDA_REG = 1e-5
+
+SEQ_LEN = 2048
+BATCH_SIZE = 8
+MAX_TEST_WINDOWS = 10
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# %% [markdown]
+#  # 评估函数
+
+# %%
+def evaluate_ppl(model, seqlen=2048, device="cuda", nsamples=None, input_ids=None):
+    if input_ids is None:
+        raise ValueError("evaluate_ppl 需要预先提供 input_ids。")
+    assert input_ids.dim() == 2, "input_ids 必须是二维张量"
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    nsamples = input_ids.numel() // seqlen if nsamples is None else nsamples
+    model.eval()
+
+    nlls = []
+    loss_fct = nn.CrossEntropyLoss()
+    with torch.no_grad():
+        for i in tqdm(range(nsamples)):
+            batch = input_ids[:, (i * seqlen):((i + 1) * seqlen)].to(device)
+            outputs = model(batch)
+            logits = outputs.logits
+            shift_logits = logits[:, :-1, :]
+            shift_labels = input_ids[:, (i * seqlen):((i + 1) * seqlen)][:, 1:].to(device)
+            loss = loss_fct(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1)
+            )
+            neg_log_likelihood = loss.float() * seqlen
+            nlls.append(neg_log_likelihood)
+
+    ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen)).item()
+    return ppl
+
+
+def example_generation(model, tokenizer, device):
+    prompt = "Why research is so hard?"
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    model.eval()
+    with torch.no_grad():
+        gen_ids = model.generate(
+            **inputs,
+            max_new_tokens=64,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            use_cache=False,
+        )
+
+    gen_text = tokenizer.decode(gen_ids[0, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+    print("=== Example Prompt ===")
+    print(prompt)
+    print(gen_text)
+    return
+
+
+def zero_shot_eval(model, tokenizer, tasks, *,
+                   batch_size: int = 8,
+                   max_length: int = 4096,
+                   limit: int | None = None,
+                   return_full: bool = False):
+    task_list = [t.strip() for t in tasks.split(",")] if isinstance(tasks, str) else list(tasks)
+
+    model.seqlen = max_length
+    lm_obj = HFLM(pretrained=model, tokenizer=tokenizer, add_bos_token=False, batch_size=batch_size)
+    task_manager = TaskManager()
+
+    with torch.no_grad():
+        results = lm_eval.simple_evaluate(
+            model=lm_obj,
+            tasks=task_list,
+            task_manager=task_manager,
+            log_samples=False,
+            limit=limit,
+        )
+
+    print(make_table(results))
+    return results if return_full else results["results"]
+
+# %% [markdown]
+#  ## 1) 加载 model 和 dataset
+
+# %%
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH, torch_dtype=torch.float16, device_map="auto", use_cache=False
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+print("原始模型已加载。")
+
+hack_layer_ids = list(range(1)) 
+active_hack_layer_id = hack_layer_ids[0] if len(hack_layer_ids) > 0 else 0
+
+original_layers = {lid: copy.deepcopy(model.model.layers[lid].self_attn) for lid in hack_layer_ids}
+print(f"已缓存原始注意力层: {list(original_layers.keys())}")
+
+ds_train = load_dataset("wikitext", DATASET_NAME, split="train")
+ds_test = load_dataset("wikitext", DATASET_NAME, split="test")
+test_texts = [ex["text"] for ex in ds_test if ex["text"].strip()]
+test_text_cat = "\n\n".join(test_texts)
+test_tok = tokenizer(test_text_cat, return_tensors="pt")
+test_ids_all = tokenizer("\n\n".join(ds_test["text"]), return_tensors="pt").input_ids
+print("评估数据已缓存。")
+
+rotary_full = LlamaRotaryEmbedding(config=model.model.layers[0].self_attn.config).to(device=device, dtype=torch.float16)
+
+
+def reset_model(model, original_layers, layer_ids):
+    layers = {}
+    if isinstance(layer_ids, int):
+        layer_ids = [layer_ids]
+    for layer_id in layer_ids:
+        model.model.layers[layer_id].self_attn = copy.deepcopy(original_layers[layer_id])
+        layers[layer_id] = model.model.layers[layer_id].self_attn
+    print(f"已将第 {layer_ids} 层注意力恢复为原始权重")
+    return layers
+
+# %% [markdown]
+#  ## 2) 训练/剪枝辅助函数
+
+# %%
+def sample_batch(tokenizer, batch_size=8, seq_len=128, device=device):
+    texts = []
+    while len(texts) < batch_size:
+        t = ds_train[np.random.randint(len(ds_train))]["text"].strip()
+        if t:
+            texts.append(t)
+    tok = tokenizer(
+        texts, max_length=seq_len, truncation=True, padding="max_length", return_tensors="pt"
+    )
+    return tok.input_ids.to(device)
+
+
+@torch.no_grad()
+def capture_layer_input_hidden_states(model, input_ids, layer_id, device):
+    captured = {}
+
+    class _StopForward(Exception):
+        pass
+
+    def _pre_hook(module, args):
+        captured[layer_id] = args[0].detach()
+        raise _StopForward()
+
+    handle = model.model.layers[layer_id].register_forward_pre_hook(_pre_hook)
+    assert model.config.use_cache is False, "use_cache 必须为 False"
+    model.eval()
+    try:
+        _ = model(input_ids.to(device))
+    except _StopForward:
+        pass
+    finally:
+        handle.remove()
+
+    if layer_id not in captured:
+        raise RuntimeError(f"未捕获到第 {layer_id} 层的 hidden states")
+
+    return captured[layer_id]
+
+
+def rope_pair_to_indices(head_dim: int, pair_idx: int) -> tuple[int, int]:
+    """将 pair 索引映射为 RoPE 真正配对的两个维度 (i, i + head_dim/2)。"""
+    half = head_dim // 2
+    return pair_idx, pair_idx + half
+
+
+def compute_pair_scores(model, layer_id, attn_module, batches=8, batch_size=8, seq_len=512, device=device):
+    """计算给定注意力层的 RoPE 二元组能量，用于筛选重要频率维度。"""
+    head_dim = attn_module.head_dim
+    num_kv = attn_module.k_proj.weight.shape[0] // head_dim
+    pair_scores = torch.zeros(num_kv, head_dim // 2, device=device, dtype=torch.float32)
+    total = 0
+
+    for _ in tqdm(range(batches), desc=f"RoPE pair scoring @layer{layer_id}"):
+        input_ids = sample_batch(tokenizer, batch_size=batch_size, seq_len=seq_len, device=device)
+        hs = capture_layer_input_hidden_states(model, input_ids, layer_id, device)
+        hs = model.model.layers[layer_id].input_layernorm(hs)
+        B, T, _ = hs.shape
+        pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        dummy = torch.empty(B, num_kv, T, head_dim, device=device, dtype=hs.dtype)
+        cos, sin = rotary_full(dummy, pos_ids)
+
+        # 直接使用原始注意力层的权重来估计 RoPE pair 能量
+        weight = attn_module.k_proj.weight.to(device=device, dtype=hs.dtype)
+        bias = attn_module.k_proj.bias
+        bias = bias.to(device=device, dtype=hs.dtype) if bias is not None else None
+        k_full = F.linear(hs, weight, bias)
+        k_full = k_full.view(B, T, num_kv, head_dim).transpose(1, 2)
+        _, k_rope = apply_rotary_pos_emb(None, k_full, cos, sin)
+        k_rope_fp32 = k_rope.to(torch.float32)
+        first_half, second_half = torch.chunk(k_rope_fp32, 2, dim=-1)
+        energy = (first_half.pow(2) + second_half.pow(2)).mean(dim=(0, 2))
+        pair_scores += energy
+        total += 1
+
+    pair_scores /= max(total, 1)
+    return pair_scores.detach().cpu()
+
+
+def select_top_pairs(pair_scores, keep_ratio):
+    """基于能量排序选择每个头需保留的 RoPE pair 索引。"""
+    keep_pairs = []
+    num_heads, num_pairs = pair_scores.shape
+    keep = max(1, int(round(num_pairs * keep_ratio)))
+    for head_idx in range(num_heads):
+        _, indices = torch.topk(pair_scores[head_idx], k=keep, largest=True, sorted=False)
+        keep_pairs.append(sorted(indices.tolist()))
+    return keep_pairs
+
+
+def get_linear_full_params(linear_module: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(linear_module, StructuredPrunedLinear):
+        return linear_module.full_weight(), linear_module.full_bias()
+    return linear_module.weight, linear_module.bias
+
+
+def create_structured_pruned_linear(original_linear: nn.Linear, head_dim: int, keep_pairs: list[list[int]]):
+    weight = original_linear.weight.data
+    device = weight.device
+    dtype = weight.dtype
+    num_heads = weight.shape[0] // head_dim
+    keep_rows = []
+    for head_idx in range(num_heads):
+        base = head_idx * head_dim
+        for pair_idx in keep_pairs[head_idx]:
+            idx_a, idx_b = rope_pair_to_indices(head_dim, pair_idx)
+            keep_rows.extend([base + idx_a, base + idx_b])
+    keep_rows = sorted(set(keep_rows))
+    if len(keep_rows) == 0:
+        raise ValueError("keep_rows 为空，无法构建裁剪后的线性层")
+    keep_idx_tensor = torch.tensor(keep_rows, device=device, dtype=torch.long)
+
+    latent_dim = len(keep_rows)
+    core = nn.Linear(original_linear.in_features, latent_dim, bias=original_linear.bias is not None, dtype=dtype, device=device)
+    core.weight.data.copy_(weight[keep_idx_tensor])
+    if original_linear.bias is not None:
+        core.bias.data.copy_(original_linear.bias.data[keep_idx_tensor])
+    for param in core.parameters():
+        param.requires_grad_(False)
+
+    post = nn.Linear(latent_dim, original_linear.out_features, bias=False, dtype=dtype, device=device)
+    post.weight.data.zero_()
+    for col, orig_row in enumerate(keep_rows):
+        post.weight.data[orig_row, col] = 1.0
+
+    pruned_linear = StructuredPrunedLinear(core, post, keep_idx_tensor.cpu())
+    return pruned_linear
+
+
+def alignment_loss(model, input_ids, layer_id, original_attn):
+    """以原模型为 teacher，对齐剪枝后 RoPE key 以降低语义漂移。"""
+    B, T = input_ids.shape
+    pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+
+    hs = capture_layer_input_hidden_states(model, input_ids, layer_id, device)
+    hs = model.model.layers[layer_id].input_layernorm(hs)
+    hack_attn = model.model.layers[layer_id].self_attn
+    head_dim = hack_attn.head_dim
+
+    # 原始注意力层输出视为 teacher，用于对齐剪枝后的 key
+    weight_ref, bias_ref = get_linear_full_params(original_attn.k_proj)
+    weight_ref = weight_ref.to(device=device, dtype=hs.dtype)
+    if bias_ref is not None:
+        bias_ref = bias_ref.to(device=device, dtype=hs.dtype)
+    num_kv = weight_ref.shape[0] // head_dim
+    dummy = torch.empty(B, num_kv, T, head_dim, device=device, dtype=hs.dtype)
+    cos, sin = rotary_full(dummy, pos_ids)
+    cos = cos.to(torch.float32)
+    sin = sin.to(torch.float32)
+    k_ref = F.linear(hs, weight_ref, bias_ref).view(B, T, num_kv, head_dim).transpose(1, 2)
+    _, k_ref_rope = apply_rotary_pos_emb(None, k_ref.to(torch.float32), cos, sin)
+
+    proj_dtype = hack_attn.k_proj.core.weight.dtype if isinstance(hack_attn.k_proj, StructuredPrunedLinear) else hack_attn.k_proj.weight.dtype
+    hs_cast = hs.to(dtype=proj_dtype)
+    k_new = hack_attn.k_proj(hs_cast).view(B, T, num_kv, head_dim).transpose(1, 2)
+    _, k_new_rope = apply_rotary_pos_emb(None, k_new.to(torch.float32), cos, sin)
+
+    return F.mse_loss(k_new_rope, k_ref_rope)
+
+# %% [markdown]
+#  ## 3) 结构化剪枝 + Masked Finetune + 评估
+
+# %%
+torch.manual_seed(42)
+np.random.seed(42)
+
+reset_model(model, original_layers, layer_ids=hack_layer_ids)
+
+print("\n===== 阶段一：先对目标层执行结构化剪枝（无微调） =====")
+pruned_layers: dict[int, nn.Module] = {}
+keep_pairs_map: dict[int, list[list[int]]] = {}
+pair_scores_map: dict[int, torch.Tensor] = {}
+
+for layer_id in hack_layer_ids:
+    print(f"\n--> 剪枝第 {layer_id} 层")
+    hack_attn = model.model.layers[layer_id].self_attn
+    original_attn = copy.deepcopy(original_layers[layer_id])
+
+    pair_scores = compute_pair_scores(
+        model,
+        layer_id=layer_id,
+        attn_module=original_attn,
+        batches=IMPORTANCE_BATCHES,
+        batch_size=IMPORTANCE_BATCH_SIZE,
+        seq_len=IMPORTANCE_SEQ_LEN,
+        device=device,
+    )
+    keep_pairs = select_top_pairs(pair_scores, KEEP_RATIO)
+    print(f"每个头保留 {len(keep_pairs[0])} 对（{len(keep_pairs[0]) * 2} 个维度）")
+
+    pruned_linear_k = create_structured_pruned_linear(hack_attn.k_proj, hack_attn.head_dim, keep_pairs)
+    pruned_linear_v = create_structured_pruned_linear(hack_attn.v_proj, hack_attn.head_dim, keep_pairs)
+    hack_attn.k_proj = pruned_linear_k
+    hack_attn.v_proj = pruned_linear_v
+
+    pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
+    keep_pairs_map[layer_id] = keep_pairs
+    pair_scores_map[layer_id] = pair_scores
+
+pruned_all_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
+print(f"\n>>> 所有目标层仅剪枝（无微调）后的整体 PPL: {pruned_all_ppl:.4f}")
+
+print("\n===== 阶段二：逐层 Masked Finetune =====")
+best_layers: dict[int, nn.Module] = {layer_id: copy.deepcopy(pruned_layers[layer_id]) for layer_id in hack_layer_ids}
+
+for layer_id in hack_layer_ids:
+    print(f"\n--> Finetune 第 {layer_id} 层")
+    hack_attn = model.model.layers[layer_id].self_attn
+    original_attn = copy.deepcopy(original_layers[layer_id])
+
+    loss_hist = []
+    ppl_hist = []
+    current_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
+    print(f"剪枝后整体 PPL（作为该层微调起点）: {current_ppl:.4f}")
+    best_ppl = current_ppl
+    best_attn = copy.deepcopy(hack_attn).to(torch.float16)
+
+    if MASK_FINETUNE_STEPS > 0:
+        print("开始 Masked Finetune……")
+        train_params: list[torch.nn.Parameter] = []
+        def _append_param(param: torch.nn.Parameter):
+            if not any(existing is param for existing in train_params):
+                train_params.append(param)
+        finetune_targets = [hack_attn.k_proj, hack_attn.v_proj]
+        for linear_module in finetune_targets:
+            if isinstance(linear_module, StructuredPrunedLinear):
+                for p in linear_module.frozen_parameters():
+                    p.requires_grad_(False)
+                for p in linear_module.finetune_parameters():
+                    _append_param(p)
+            else:
+                _append_param(linear_module.weight)
+                if linear_module.bias is not None:
+                    _append_param(linear_module.bias)
+        for p in hack_attn.parameters():
+            p.requires_grad_(False)
+        for p in train_params:
+            p.requires_grad_(True)
+        init_params = [p.detach().clone() for p in train_params]
+        optimizer = torch.optim.AdamW(train_params, lr=MASK_FINETUNE_LR, weight_decay=1e-6, eps=1e-8)
+
+        hack_attn.to(dtype=torch.float32)
+
+        for step in tqdm(range(1, MASK_FINETUNE_STEPS + 1), desc=f"Masked finetune @layer{layer_id}"):
+            input_ids = sample_batch(tokenizer, BATCH_SIZE, SEQ_LEN, device)
+            optimizer.zero_grad(set_to_none=True)
+            align = alignment_loss(model, input_ids, layer_id, original_attn)
+            reg = sum(torch.sum((p - p_init).pow(2)) for p, p_init in zip(train_params, init_params))
+            loss = align + MASK_LAMBDA_REG * reg
+            if torch.isfinite(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(train_params, 0.05)
+                optimizer.step()
+                loss_hist.append(float(loss.item()))
+
+            if step % EVAL_EVERY_MASK == 0:
+                hack_attn_eval = copy.deepcopy(hack_attn).to(torch.float16)
+                hack_attn_eval.eval()
+                model.model.layers[layer_id].self_attn = hack_attn_eval
+                ppl = evaluate_ppl(model, SEQ_LEN, device=device, nsamples=10, input_ids=test_ids_all)
+                ppl_hist.append(ppl)
+                print(f"Step {step}: masked_align={loss.item():.6e}, PPL={ppl:.4f}")
+                if ppl < best_ppl:
+                    best_ppl = ppl
+                    best_attn = copy.deepcopy(model.model.layers[layer_id].self_attn)
+                model.model.layers[layer_id].self_attn = hack_attn
+
+        hack_attn.to(dtype=torch.float16)
+
+    model.model.layers[layer_id].self_attn = best_attn
+    best_layers[layer_id] = copy.deepcopy(model.model.layers[layer_id].self_attn)
+    layer_final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
+    print(f"第 {layer_id} 层微调完成后整体 PPL: {layer_final_ppl:.4f}")
+    example_generation(model, tokenizer, device)
+    print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+
+# %% [markdown]
+#  ## 评估 PPL & OpenBookQA
+
+# %%
+attn_layers = reset_model(model, original_layers, hack_layer_ids)
+ppl_original = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+res_original = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+print(f"👉🏻👉🏻👉🏻👉🏻原始模型: PPL= {ppl_original:.4f}")
+example_generation(model, tokenizer, device)
+print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+
+# 结构化剪枝后（未 finetune）
+for layer_id in hack_layer_ids:
+    model.model.layers[layer_id].self_attn = copy.deepcopy(pruned_layers[layer_id])
+
+ppl_pruned = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+res_pruned = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 (layer={hack_layer_ids}) 未 finetune: PPL= {ppl_pruned:.4f}")
+example_generation(model, tokenizer, device)
+print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+
+# 结构化剪枝 + masked finetune
+for layer_id in hack_layer_ids:
+    model.model.layers[layer_id].self_attn = best_layers[layer_id]
+
+final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+res_pruned_finetune = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 + masked finetune (layer={hack_layer_ids}): PPL= {final_ppl:.4f}")
+example_generation(model, tokenizer, device)
+print("\n--------------------------------------------------------------------------------------------------------------------------------\n")
+
+# %% [markdown]
+#  ### 保存权重
+
+# %%
+try:
+    os.makedirs("HACKDump", exist_ok=True)
+except OSError as e:
+    print(f"创建 HACKDump 目录失败: {e}")
+
+for layer_id, best_attn in best_layers.items():
+    path = f"HACKDump/{MODEL_PATH.split('/')[-1]}_layer{layer_id}_structured.pt"
+    try:
+        torch.save(best_attn.state_dict(), path)
+        print(f"已保存第 {layer_id} 层最优权重到 {path}")
+    except OSError as e:
+        print(f"保存第 {layer_id} 层权重失败: {e}")
