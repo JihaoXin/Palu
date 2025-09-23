@@ -3,11 +3,14 @@
 
 # %%
 import os
+import json
 import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from functools import lru_cache
+from safetensors import safe_open
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -17,7 +20,6 @@ import lm_eval
 from lm_eval.models.huggingface import HFLM
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import make_table
-
 
 class StructuredPrunedLinear(nn.Module):
     """线性层裁剪后保留核心投影 + 可训练的后处理矩阵（初始为单位阵）。"""
@@ -73,7 +75,7 @@ KEEP_RATIO = 0.7                # 每个头仅保留前 KEEP_RATIO 的 RoPE 配�
 IMPORTANCE_BATCHES = 24         # 采样批次数以估计 RoPE pair 重要性
 IMPORTANCE_BATCH_SIZE = 8
 IMPORTANCE_SEQ_LEN = 2048
-MASK_FINETUNE_STEPS = 2000       # 结构化剪枝后可选的 masked finetune steps
+MASK_FINETUNE_STEPS = 1000       # 结构化剪枝后可选的 masked finetune steps
 EVAL_EVERY_MASK = 100
 MASK_FINETUNE_LR = 2e-4
 MASK_LAMBDA_REG = 1e-5
@@ -82,7 +84,20 @@ SEQ_LEN = 2048
 BATCH_SIZE = 8
 MAX_TEST_WINDOWS = 10
 
-pruned_hack_layer_ids = list(range(0, 17))
+pruned_hack_layer_ids = None
+
+PALU_MODEL_DIR = os.path.abspath(
+    os.environ.get(
+        "PALU_MODEL_DIR",
+        "Meta-Llama-3-8B-Instruct_ratio-0.7_gs-4-fisher_uniform-whiten",
+    )
+)
+PALU_CONFIG_PATH = os.path.join(PALU_MODEL_DIR, "config.json")
+if not os.path.isfile(PALU_CONFIG_PATH):
+    raise FileNotFoundError(f"未找到 PaLU 模型配置文件: {PALU_CONFIG_PATH}")
+with open(PALU_CONFIG_PATH, "r", encoding="utf-8") as _cfg_fh:
+    PALU_CONFIG = json.load(_cfg_fh)
+PALU_HEADWISE_RANKS: dict[str, list[int]] = PALU_CONFIG.get("head_wise_ranks", {})
 
 
 def print_meta_info(extra: dict | None = None):
@@ -101,6 +116,7 @@ def print_meta_info(extra: dict | None = None):
         "SEQ_LEN": SEQ_LEN,
         "BATCH_SIZE": BATCH_SIZE,
         "MAX_TEST_WINDOWS": MAX_TEST_WINDOWS,
+        "PALU_MODEL_DIR": PALU_MODEL_DIR,
     }
     if extra:
         meta_fields.update(extra)
@@ -111,7 +127,7 @@ def print_meta_info(extra: dict | None = None):
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-dump_dir = "HACKDump"
+dump_dir = "RAPDump"
 try:
     os.makedirs(dump_dir, exist_ok=True)
 except OSError as e:
@@ -123,6 +139,114 @@ def get_layer_dump_path(layer_id: int) -> str | None:
     if dump_dir is None:
         return None
     return f"{dump_dir}/{MODEL_PATH.split('/')[-1]}_layer{layer_id}_structured.pt"
+
+
+_palu_weight_map: dict[str, str] | None = None
+
+
+def _get_palu_weight_map() -> dict[str, str]:
+    global _palu_weight_map
+    if _palu_weight_map is None:
+        index_path = os.path.join(PALU_MODEL_DIR, "model.safetensors.index.json")
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(
+                f"未找到 PaLU 模型索引文件: {index_path}. 请确认 PALU_MODEL_DIR 设置正确。"
+            )
+        with open(index_path, "r", encoding="utf-8") as fh:
+            index_json = json.load(fh)
+        weight_map = index_json.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError("PaLU 模型索引格式异常，缺少 weight_map 字段。")
+        _palu_weight_map = weight_map
+    return _palu_weight_map
+
+
+def _load_palu_tensor(param_key: str) -> torch.Tensor:
+    weight_map = _get_palu_weight_map()
+    shard = weight_map.get(param_key)
+    if shard is None:
+        raise KeyError(f"PaLU 模型中未找到参数 {param_key}")
+    shard_path = os.path.join(PALU_MODEL_DIR, shard)
+    with safe_open(shard_path, framework="pt", device="cpu") as fh:
+        return fh.get_tensor(param_key)
+
+
+@lru_cache(maxsize=None)
+def _get_palu_v_tensors(layer_id: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    prefix = f"model.layers.{layer_id}.self_attn.v_proj"
+    ranks = PALU_HEADWISE_RANKS.get(prefix)
+    if ranks is None:
+        raise KeyError(f"PaLU 配置中缺少 {prefix} 的 head_wise_ranks 信息")
+
+    vt_key = f"{prefix}.VT.weight"
+    vt = _load_palu_tensor(vt_key)
+    vt_dtype = vt.dtype
+
+    blocks = []
+    offset = 0
+    for idx, rank in enumerate(ranks):
+        u_key = f"{prefix}.U.{idx}.weight"
+        u_weight = _load_palu_tensor(u_key)
+        vt_chunk = vt[offset:offset + rank, :]
+        offset += rank
+
+        block = u_weight.to(torch.float32) @ vt_chunk.to(torch.float32)
+        blocks.append(block.to(vt_dtype))
+
+    weight = torch.cat(blocks, dim=0).contiguous()
+    return weight, None
+
+
+def build_palu_v_linear(layer_id: int, *, dtype: torch.dtype, device: torch.device) -> nn.Linear:
+    weight_cpu, bias_cpu = _get_palu_v_tensors(layer_id)
+    out_features, in_features = weight_cpu.shape
+    has_bias = bias_cpu is not None
+    linear = nn.Linear(in_features, out_features, bias=has_bias, dtype=dtype, device=device)
+    linear.weight.data.copy_(weight_cpu.to(device=device, dtype=dtype))
+    if has_bias and bias_cpu is not None:
+        linear.bias.data.copy_(bias_cpu.to(device=device, dtype=dtype))
+    for param in linear.parameters():
+        param.requires_grad_(False)
+    return linear
+
+
+def restore_layer_from_dump(
+    layer_id: int,
+    hack_attn: nn.Module,
+    original_attn: nn.Module,
+) -> bool:
+    dump_path = get_layer_dump_path(layer_id)
+    if dump_path is None or not os.path.isfile(dump_path):
+        return False
+
+    try:
+        saved_state = torch.load(dump_path, map_location="cpu")
+    except OSError as exc:
+        print(f"加载第 {layer_id} 层裁剪结果失败，将重新计算。原因: {exc}")
+        return False
+
+    try:
+        k_proj_restored = StructuredPrunedLinear.from_dumped(original_attn.k_proj, saved_state, "k_proj.")
+    except KeyError as exc:
+        print(f"第 {layer_id} 层保存的权重缺少必要的 k_proj 信息: {exc}，将重新计算。")
+        return False
+
+    dtype = hack_attn.v_proj.weight.dtype
+    device = hack_attn.v_proj.weight.device
+    v_proj_restored = build_palu_v_linear(layer_id, dtype=dtype, device=device)
+
+    hack_attn.k_proj = k_proj_restored
+    hack_attn.v_proj = v_proj_restored
+
+    filtered_state = {k: v for k, v in saved_state.items() if not k.startswith("v_proj.")}
+    hack_attn.load_state_dict(filtered_state, strict=False)
+
+    hack_attn.to(dtype=torch.float16)
+    for param in hack_attn.v_proj.parameters():
+        param.requires_grad_(False)
+
+    print(f"检测到第 {layer_id} 层已有裁剪结果，已从 {dump_path} 恢复（V 来自 PaLU 模型）。")
+    return True
 
 # %% [markdown]
 #  # 评估函数
@@ -142,7 +266,7 @@ def evaluate_ppl(model, seqlen=2048, device="cuda", nsamples=None, input_ids=Non
     nlls = []
     loss_fct = nn.CrossEntropyLoss()
     with torch.no_grad():
-        for i in tqdm(range(nsamples)):
+        for i in tqdm(range(nsamples),disable=True):
             batch = input_ids[:, (i * seqlen):((i + 1) * seqlen)].to(device)
             outputs = model(batch)
             logits = outputs.logits
@@ -241,6 +365,16 @@ test_texts = [ex["text"] for ex in ds_test if ex["text"].strip()]
 test_text_cat = "\n\n".join(test_texts)
 test_tok = tokenizer(test_text_cat, return_tensors="pt")
 test_ids_all = tokenizer("\n\n".join(ds_test["text"]), return_tensors="pt").input_ids
+print("评估数据已缓存。")
+
+print("\n===== 原始模型评估 =====")
+baseline_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+print(f"原始模型整体 PPL: {baseline_ppl:.4f}")
+print("原始模型 Zero-shot:")
+baseline_zero_shot = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+
+example_generation(model, tokenizer, device)
+
 rotary_full = LlamaRotaryEmbedding(config=model.model.layers[0].self_attn.config).to(device=device, dtype=torch.float16)
 
 
@@ -309,7 +443,7 @@ def compute_pair_scores(model, layer_id, attn_module, batches=8, batch_size=8, s
     pair_scores = torch.zeros(num_kv, head_dim // 2, device=device, dtype=torch.float32)
     total = 0
 
-    for _ in tqdm(range(batches), desc=f"RoPE pair scoring @layer{layer_id}"):
+    for _ in tqdm(range(batches), desc=f"RoPE pair scoring @layer{layer_id}",disable=True):
         input_ids = sample_batch(tokenizer, batch_size=batch_size, seq_len=seq_len, device=device)
         hs = capture_layer_input_hidden_states(model, input_ids, layer_id, device)
         hs = model.model.layers[layer_id].input_layernorm(hs)
@@ -422,193 +556,146 @@ def alignment_loss(model, input_ids, layer_id, original_attn):
 torch.manual_seed(42)
 np.random.seed(42)
 
-print("\n===== 阶段一：先对目标层执行结构化剪枝（无微调） =====")
+print("\n===== 顺序层级剪枝 + Masked Finetune =====")
 pruned_layers: dict[int, nn.Module] = {}
-keep_pairs_map: dict[int, list[list[int]]] = {}
-pair_scores_map: dict[int, torch.Tensor] = {}
+best_layers: dict[int, nn.Module] = {}
+keep_pairs_map: dict[int, list[list[int]] | None] = {}
+pair_scores_map: dict[int, torch.Tensor | None] = {}
 
 for layer_id in hack_layer_ids:
-    print(f"--> 剪枝第 {layer_id} 层")
-    hack_attn = model.model.layers[layer_id].self_attn
-    original_attn = copy.deepcopy(original_layers[layer_id])
-
-    restored_from_dump = False
-    dump_path = get_layer_dump_path(layer_id)
-    if (
-        dump_path is not None
-        and layer_id in pruned_hack_layer_ids
-        and os.path.isfile(dump_path)
-    ):
-        try:
-            saved_state = torch.load(dump_path, map_location="cpu")
-            hack_attn.k_proj = StructuredPrunedLinear.from_dumped(original_attn.k_proj, saved_state, "k_proj.")
-            hack_attn.v_proj = StructuredPrunedLinear.from_dumped(original_attn.v_proj, saved_state, "v_proj.")
-            hack_attn.load_state_dict(saved_state)
-            hack_attn.to(dtype=torch.float16)
-            pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
-            keep_pairs_map[layer_id] = None
-            pair_scores_map[layer_id] = None
-            print(f"检测到第 {layer_id} 层已有裁剪结果，已从 {dump_path} 恢复。")
-            restored_from_dump = True
-        except (OSError, RuntimeError, KeyError) as exc:
-            print(f"加载第 {layer_id} 层裁剪结果失败，将重新计算。原因: {exc}")
-
-    if restored_from_dump:
-        continue
-
-    pair_scores = compute_pair_scores(
-        model,
-        layer_id=layer_id,
-        attn_module=original_attn,
-        batches=IMPORTANCE_BATCHES,
-        batch_size=IMPORTANCE_BATCH_SIZE,
-        seq_len=IMPORTANCE_SEQ_LEN,
-        device=device,
-    )
-    keep_pairs = select_top_pairs(pair_scores, KEEP_RATIO)
-    print(f"每个头保留 {len(keep_pairs[0])} 对（{len(keep_pairs[0]) * 2} 个维度）")
-
-    pruned_linear_k = create_structured_pruned_linear(hack_attn.k_proj, hack_attn.head_dim, keep_pairs)
-    pruned_linear_v = create_structured_pruned_linear(hack_attn.v_proj, hack_attn.head_dim, keep_pairs)
-    hack_attn.k_proj = pruned_linear_k
-    hack_attn.v_proj = pruned_linear_v
-
-    pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
-    keep_pairs_map[layer_id] = keep_pairs
-    pair_scores_map[layer_id] = pair_scores
-
-pruned_all_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
-print(f"\n>>> 所有目标层仅剪枝（无微调）后的整体 PPL: {pruned_all_ppl:.4f}")
-
-print("\n===== 阶段二：逐层 Masked Finetune =====")
-best_layers: dict[int, nn.Module] = {layer_id: copy.deepcopy(pruned_layers[layer_id]) for layer_id in hack_layer_ids}
-
-for layer_id in hack_layer_ids:
-    print("--------------------------------------------------------------------------------------------------------------------------------")
-    print(f"\n--> Finetune 第 {layer_id} 层")
+    print("================================================================================================================================")
+    print(f"\n>>> 处理第 {layer_id} 层")
     hack_attn = model.model.layers[layer_id].self_attn
     original_attn = copy.deepcopy(original_layers[layer_id])
 
     resumed_from_dump = False
-    dump_path = get_layer_dump_path(layer_id)
-    if (
-        layer_id in pruned_hack_layer_ids
-        and dump_path is not None
-        and os.path.isfile(dump_path)
-    ):
-        try:
-            state_dict = torch.load(dump_path, map_location="cpu")
-            hack_attn.load_state_dict(state_dict)
-            hack_attn.to(dtype=torch.float16)
-            model.model.layers[layer_id].self_attn = hack_attn
+    if layer_id in pruned_hack_layer_ids:
+        resumed_from_dump = restore_layer_from_dump(layer_id, hack_attn, original_attn)
+        if resumed_from_dump:
+            pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
             best_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
-            print(f"检测到第 {layer_id} 层已有微调结果，已从 {dump_path} 恢复。")
-            resumed_from_dump = True
-        except (OSError, RuntimeError) as e:
-            print(f"加载第 {layer_id} 层已有权重失败，将重新微调。原因: {e}")
+            keep_pairs_map[layer_id] = None
+            pair_scores_map[layer_id] = None
+
+    if not resumed_from_dump:
+        print("计算 RoPE pair 重要性……")
+        pair_scores = compute_pair_scores(
+            model,
+            layer_id=layer_id,
+            attn_module=original_attn,
+            batches=IMPORTANCE_BATCHES,
+            batch_size=IMPORTANCE_BATCH_SIZE,
+            seq_len=IMPORTANCE_SEQ_LEN,
+            device=device,
+        )
+        keep_pairs = select_top_pairs(pair_scores, KEEP_RATIO)
+        print(f"每个头保留 {len(keep_pairs[0])} 对（{len(keep_pairs[0]) * 2} 个维度）")
+
+        pruned_linear_k = create_structured_pruned_linear(hack_attn.k_proj, hack_attn.head_dim, keep_pairs)
+        hack_attn.k_proj = pruned_linear_k
+        hack_attn.v_proj = build_palu_v_linear(
+            layer_id,
+            dtype=hack_attn.v_proj.weight.dtype,
+            device=hack_attn.v_proj.weight.device,
+        )
+        for param in hack_attn.v_proj.parameters():
+            param.requires_grad_(False)
+
+        pruned_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
+        keep_pairs_map[layer_id] = keep_pairs
+        pair_scores_map[layer_id] = pair_scores
+
+        print(f"👉🏻👉🏻👉🏻👉🏻Prune第 {layer_id} 层 Zero-shot ：")
+        prune_zero_shot = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
 
     if resumed_from_dump:
-        continue
+        print("该层已存在微调结果，跳过 Masked Finetune。")
+        best_layers[layer_id] = copy.deepcopy(hack_attn).to(torch.float16)
+    else:
+        loss_hist = []
+        ppl_hist = []
+        current_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+        print(f"👉🏻👉🏻👉🏻👉🏻Prune第 {layer_id} 层 PPL: {current_ppl:.4f}")
+        best_ppl = current_ppl
+        best_attn = copy.deepcopy(hack_attn).to(torch.float16)
 
-    loss_hist = []
-    ppl_hist = []
-    current_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
-    print(f"剪枝后整体 PPL（作为该层微调起点）: {current_ppl:.4f}")
-    best_ppl = current_ppl
-    best_attn = copy.deepcopy(hack_attn).to(torch.float16)
+        if MASK_FINETUNE_STEPS > 0:
+            print("开始 Masked Finetune……")
+            train_params: list[torch.nn.Parameter] = []
 
-    if MASK_FINETUNE_STEPS > 0:
-        print("开始 Masked Finetune……")
-        train_params: list[torch.nn.Parameter] = []
-        def _append_param(param: torch.nn.Parameter):
-            if not any(existing is param for existing in train_params):
-                train_params.append(param)
-        finetune_targets = [hack_attn.k_proj, hack_attn.v_proj]
-        for linear_module in finetune_targets:
-            if isinstance(linear_module, StructuredPrunedLinear):
-                for p in linear_module.frozen_parameters():
-                    p.requires_grad_(False)
-                for p in linear_module.finetune_parameters():
-                    _append_param(p)
-            else:
-                _append_param(linear_module.weight)
-                if linear_module.bias is not None:
-                    _append_param(linear_module.bias)
-        for p in hack_attn.parameters():
-            p.requires_grad_(False)
-        for p in train_params:
-            p.requires_grad_(True)
-        init_params = [p.detach().clone() for p in train_params]
-        optimizer = torch.optim.AdamW(train_params, lr=MASK_FINETUNE_LR, weight_decay=1e-6, eps=1e-8)
+            def _append_param(param: torch.nn.Parameter):
+                if not any(existing is param for existing in train_params):
+                    train_params.append(param)
 
-        hack_attn.to(dtype=torch.float32)
+            finetune_targets = [hack_attn.k_proj]
+            for linear_module in finetune_targets:
+                if isinstance(linear_module, StructuredPrunedLinear):
+                    for p in linear_module.frozen_parameters():
+                        p.requires_grad_(False)
+                    for p in linear_module.finetune_parameters():
+                        _append_param(p)
+                else:
+                    _append_param(linear_module.weight)
+                    if linear_module.bias is not None:
+                        _append_param(linear_module.bias)
 
-        for step in tqdm(range(1, MASK_FINETUNE_STEPS + 1), desc=f"Masked finetune @layer{layer_id}"):
-            input_ids = sample_batch(tokenizer, BATCH_SIZE, SEQ_LEN, device)
-            optimizer.zero_grad(set_to_none=True)
-            align = alignment_loss(model, input_ids, layer_id, original_attn)
-            reg = sum(torch.sum((p - p_init).pow(2)) for p, p_init in zip(train_params, init_params))
-            loss = align + MASK_LAMBDA_REG * reg
-            if torch.isfinite(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(train_params, 0.05)
-                optimizer.step()
-                loss_hist.append(float(loss.item()))
+            for param in hack_attn.v_proj.parameters():
+                param.requires_grad_(False)
+            for p in hack_attn.parameters():
+                p.requires_grad_(False)
+            for p in train_params:
+                p.requires_grad_(True)
 
-            if step % EVAL_EVERY_MASK == 0:
-                hack_attn_eval = copy.deepcopy(hack_attn).to(torch.float16)
-                hack_attn_eval.eval()
-                model.model.layers[layer_id].self_attn = hack_attn_eval
-                ppl = evaluate_ppl(model, SEQ_LEN, device=device, nsamples=10, input_ids=test_ids_all)
-                ppl_hist.append(ppl)
-                print(f"Step {step}: masked_align={loss.item():.6e}, PPL={ppl:.4f}")
-                if ppl < best_ppl:
-                    best_ppl = ppl
-                    best_attn = copy.deepcopy(model.model.layers[layer_id].self_attn)
-                model.model.layers[layer_id].self_attn = hack_attn
+            init_params = [p.detach().clone() for p in train_params]
+            optimizer = torch.optim.AdamW(train_params, lr=MASK_FINETUNE_LR, weight_decay=1e-6, eps=1e-8)
 
-        hack_attn.to(dtype=torch.float16)
+            hack_attn.to(dtype=torch.float32)
 
-    model.model.layers[layer_id].self_attn = best_attn
-    best_layers[layer_id] = copy.deepcopy(model.model.layers[layer_id].self_attn)
-    layer_final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all, nsamples=10)
-    print(f"第 {layer_id} 层微调完成后整体 PPL: {layer_final_ppl:.4f}")
-    dump_path = get_layer_dump_path(layer_id)
-    if dump_path is not None:
-        try:
-            torch.save(best_layers[layer_id].state_dict(), dump_path)
-            print(f"已保存第 {layer_id} 层最优权重到 {dump_path}")
-        except OSError as e:
-            print(f"保存第 {layer_id} 层权重失败: {e}")
-    example_generation(model, tokenizer, device)
+            for step in tqdm(range(1, MASK_FINETUNE_STEPS + 1), desc=f"Masked finetune @layer{layer_id}", disable=True):
+                input_ids = sample_batch(tokenizer, BATCH_SIZE, SEQ_LEN, device)
+                optimizer.zero_grad(set_to_none=True)
+                align = alignment_loss(model, input_ids, layer_id, original_attn)
+                reg = sum(torch.sum((p - p_init).pow(2)) for p, p_init in zip(train_params, init_params))
+                loss = align + MASK_LAMBDA_REG * reg
+                if torch.isfinite(loss):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(train_params, 0.05)
+                    optimizer.step()
+                    loss_hist.append(float(loss.item()))
 
-# %% [markdown]
-#  ## 评估 PPL & OpenBookQA
+                if step % EVAL_EVERY_MASK == 0:
+                    hack_attn_eval = copy.deepcopy(hack_attn).to(torch.float16)
+                    hack_attn_eval.eval()
+                    model.model.layers[layer_id].self_attn = hack_attn_eval
+                    ppl = evaluate_ppl(model, SEQ_LEN, device=device, nsamples=10, input_ids=test_ids_all)
+                    ppl_hist.append(ppl)
+                    print(f"Step {step}: masked_align={loss.item():.6e}, PPL={ppl:.4f}")
+                    if ppl < best_ppl:
+                        best_ppl = ppl
+                        best_attn = copy.deepcopy(model.model.layers[layer_id].self_attn)
+                    model.model.layers[layer_id].self_attn = hack_attn
 
-# %%
-attn_layers = reset_model(model, original_layers, hack_layer_ids)
-ppl_original = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
-res_original = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
-print(f"👉🏻👉🏻👉🏻👉🏻原始模型: PPL= {ppl_original:.4f}")
-example_generation(model, tokenizer, device)
-print("--------------------------------------------------------------------------------------------------------------------------------")
+            hack_attn.to(dtype=torch.float16)
 
-# 结构化剪枝后（未 finetune）
-for layer_id in hack_layer_ids:
-    model.model.layers[layer_id].self_attn = copy.deepcopy(pruned_layers[layer_id])
+        model.model.layers[layer_id].self_attn = best_attn
+        best_layers[layer_id] = copy.deepcopy(model.model.layers[layer_id].self_attn)
+        layer_final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
+        print(f"👉🏻👉🏻👉🏻👉🏻微调第 {layer_id} 层后 PPL: {layer_final_ppl:.4f}")
+        print(f"👉🏻👉🏻👉🏻👉🏻微调第 {layer_id} 层后Zero-shot：")
+        finetune_zero_shot = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+        dump_path = get_layer_dump_path(layer_id)
+        if dump_path is not None:
+            try:
+                torch.save(best_layers.get(layer_id, hack_attn).state_dict(), dump_path)
+                print(f"已保存第 {layer_id} 层最优权重到 {dump_path}")
+            except OSError as e:
+                print(f"保存第 {layer_id} 层权重失败: {e}")
 
-ppl_pruned = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
-res_pruned = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
-print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 (layer={hack_layer_ids}) 未 finetune: PPL= {ppl_pruned:.4f}")
-example_generation(model, tokenizer, device)
-print("--------------------------------------------------------------------------------------------------------------------------------")
+        example_generation(model, tokenizer, device)
 
-# 结构化剪枝 + masked finetune
-for layer_id in hack_layer_ids:
-    model.model.layers[layer_id].self_attn = best_layers[layer_id]
-
+print("\n===== 最终模型评估 =====")
 final_ppl = evaluate_ppl(model, SEQ_LEN, device=device, input_ids=test_ids_all)
-res_pruned_finetune = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
-print(f"👉🏻👉🏻👉🏻👉🏻结构化剪枝 + masked finetune (layer={hack_layer_ids}): PPL= {final_ppl:.4f}")
+print(f"最终模型整体 PPL: {final_ppl:.4f}")
+final_zero_shot = zero_shot_eval(model, tokenizer, tasks=["openbookqa"])
+print("最终模型 Zero-shot 结果:", final_zero_shot)
 example_generation(model, tokenizer, device)
-print("--------------------------------------------------------------------------------------------------------------------------------")
