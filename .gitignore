@@ -164,3 +164,4 @@ cython_debug/
 #.idea/
 
 results/
+Meta-Llama-3-8B-Instruct_ratio-*/
