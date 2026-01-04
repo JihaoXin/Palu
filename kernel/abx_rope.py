@@ -111,7 +111,7 @@ def _abx_fwd(
     tl.store(O_ptrs, abx[None, :])
 
     
-def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, *, theta: float = 10000.0) -> torch.Tensor:
     # U x V x X
     assert a.dim() == 3
     assert b.dim() == 3
@@ -145,7 +145,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # num_stages=num_stages,
         # num_warps=num_warps,
         NUM_GROUPS = NUM_GROUPS,
-        THETA = 10000.,
+        THETA = float(theta),
     )
     return out
 

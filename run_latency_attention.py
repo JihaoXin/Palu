@@ -8,7 +8,7 @@ import argparse
 import socket
 from datetime import datetime
 
-from transformers.models.llama.modeling_llama import LlamaConfig, DynamicCache, LlamaAttention
+from transformers.models.llama.modeling_llama import LlamaConfig, DynamicCache, LlamaAttention, LlamaRotaryEmbedding
 from kernel.palu_attention import LlamaPaluAttention
 
 TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
@@ -33,6 +33,7 @@ def build_attention(args):
     logging.info(f"Creating Attention, dtype: {dtype}, device: {device}")
     config = LlamaConfig()
     config.max_position_embeddings = 300000
+    config._attn_implementation = "eager"
     attention = LlamaAttention(config, layer_idx=0).to(device, dtype)
     
     return attention, config
@@ -64,10 +65,27 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
     past_key_value = DynamicCache()
     past_key_value.update(cache_k, cache_v, 0)
     
-    position_ids = torch.arange(prompt_len, prompt_len+1)
+    position_ids = torch.arange(prompt_len, prompt_len+1).to(device)
+    if position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
 
     hidden_dim = model.config.hidden_size
     input_token = torch.randn((batch_size, 1, hidden_dim), dtype=torch.float16, device=device) # only input 1 token at a time
+
+    # Check if it's standard LlamaAttention (new API) or LlamaPaluAttention (old API)
+    is_standard_llama = isinstance(model, LlamaAttention) and not isinstance(model, LlamaPaluAttention)
+    
+    if is_standard_llama:
+        # For standard LlamaAttention, use new API
+        rotary_emb = LlamaRotaryEmbedding(config=model.config).to(device)
+        position_embeddings = rotary_emb(input_token, position_ids)
+        
+        def forward_fn(input_token, past_key_value, position_ids):
+            return model(input_token, past_key_values=past_key_value, position_embeddings=position_embeddings, attention_mask=None)
+    else:
+        # For LlamaPaluAttention, use old API
+        def forward_fn(input_token, past_key_value, position_ids):
+            return model(input_token, past_key_value=past_key_value, position_ids=position_ids)
 
     # warmup
     s = torch.cuda.Stream()
@@ -75,14 +93,14 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
     with torch.no_grad():
         with torch.cuda.stream(s):
             for _ in range(25):
-                _ = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+                _ = forward_fn(input_token, past_key_value, position_ids)
     torch.cuda.current_stream().wait_stream(s)
 
     if cache_graph:
         with torch.no_grad():
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out = model(input_token, past_key_value=past_key_value, position_ids=position_ids)
+                out = forward_fn(input_token, past_key_value, position_ids)
             
         def generate(new_input_token, past_key_value, position_ids):
             input_token.copy_(new_input_token)
@@ -90,7 +108,7 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
             return out
     else:
         def generate(new_input_token, past_key_value, position_ids):
-            out = model(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
+            out = forward_fn(new_input_token, past_key_value, position_ids)
             return out
 
     new_input_token = torch.randn((batch_size, 1, hidden_dim), dtype=torch.float16, device=device) # only input 1 token at a time
@@ -99,7 +117,7 @@ def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, ba
         end   = torch.cuda.Event(enable_timing=True) 
         start.record()
         for _ in range(repeats):
-            generate(new_input_token, past_key_value=past_key_value, position_ids=position_ids)
+            generate(new_input_token, past_key_value, position_ids)
         end.record()
         torch.cuda.synchronize()
     dur = start.elapsed_time(end)

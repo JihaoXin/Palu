@@ -7,7 +7,7 @@ from torch import nn
 
 from transformers.models.llama.modeling_llama import (
     Cache, apply_rotary_pos_emb, 
-    LlamaAttention, LlamaConfig,
+    LlamaAttention, LlamaConfig, LlamaRotaryEmbedding,
 )
 
 from .abx_rope import abx as recompute_k_gemv
@@ -129,6 +129,11 @@ class LlamaPaluAttention(LlamaAttention):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         
+        # Set attributes that parent class doesn't set
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        
         self.group_size = config.group_size
         self.num_groups = config.num_groups
         self.total_rank_k = config.total_rank_k
@@ -143,13 +148,15 @@ class LlamaPaluAttention(LlamaAttention):
         self.k_proj = HeadwiseLowRankModule(self.rank_k_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = HeadwiseLowRankModule(self.rank_v_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.fused_hidden_dim_o, self.hidden_size, bias=config.attention_bias)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         golden_kernel: bool = False,
         **kwargs,
@@ -159,60 +166,53 @@ class LlamaPaluAttention(LlamaAttention):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
 
+        if past_key_values is None and "past_key_value" in kwargs:
+            past_key_values = kwargs["past_key_value"]
+
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
         key_h_states = self.k_proj.project_to_latent(hidden_states)
         value_h_states = self.v_proj.project_to_latent(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         key_h_states = key_h_states.view(bsz, q_len, self.num_groups, self.group_rank_k).transpose(1, 2)
         value_h_states = value_h_states.view(bsz, q_len, self.num_groups, self.group_rank_v).transpose(1, 2)
 
-        # kv_seq_len = key_states.shape[-2]
         kv_seq_len = key_h_states.shape[-2]
-        if past_key_value is not None:
+        if past_key_values is not None:
             if self.layer_idx is None:
                 raise ValueError(
                     f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        
-        # cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
 
-        if past_key_value is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            key_h_states, value_h_states = past_key_value.update(key_h_states, value_h_states, self.layer_idx)
+        if position_embeddings is None:
+            position_ids = kwargs.get("position_ids", None)
+            if position_ids is None:
+                if cache_position is not None:
+                    position_ids = cache_position.unsqueeze(0)
+                else:
+                    position_ids = torch.arange(kv_seq_len, device=hidden_states.device).unsqueeze(0)
+            cos, sin = self.rotary_emb(hidden_states, position_ids)
+        else:
+            cos, sin = position_embeddings
 
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_h_states, value_h_states = past_key_values.update(key_h_states, value_h_states, self.layer_idx, cache_kwargs)
 
         if q_len > 1:
-            # Prompting
-            # Recompute the key states
             key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
             key_states = self.k_proj.reconstruct(key_h_states)
             key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            # Apply RoPE after recomputing the key states
-            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         else:
-            # Generating (Apply our reconsturction kernel)
-            # A: (num_heads, 1, head_dim)
-            # B: (num_heads, rank_per_groups, head_dim)
-            # X: (num_head_groups, seq_len, rank_per_groups)
-            # TODO: Optimize RoPE & sqrt(head_dim) into kernel
-            # TODO: Check if sin & cos are share among different blocks
-            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
-            query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin, position_ids)
+            query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin)
             A = query_states.squeeze(0)
             B = self.k_proj.B
             X = key_h_states.squeeze(0)
@@ -260,7 +260,7 @@ class LlamaPaluAttention(LlamaAttention):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_values
     
     @staticmethod
     def from_attention(
