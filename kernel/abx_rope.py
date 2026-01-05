@@ -77,10 +77,12 @@ def _abx_fwd(
     xb_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
     xb_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
     for _ in range(0, tl.cdiv(R, BLOCK_SIZE_R)):
+        mask_r = offs_rs[:, None] < R
+        mask_x = (offs_ls[:, None] < seq_len) & (offs_rs[None, :] < R)
         # Load next block of B, X
-        x = tl.load(X_ptrs)
-        b_0 = tl.load(B_ptrs)
-        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_bd)
+        x = tl.load(X_ptrs, mask=mask_x, other=0.0)
+        b_0 = tl.load(B_ptrs, mask=mask_r, other=0.0)
+        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_bd, mask=mask_r, other=0.0)
         # Accumulate along R dimension.
         xb_0 = tl.dot(x, b_0, xb_0)
         xb_1 = tl.dot(x, b_1, xb_1)
@@ -103,12 +105,15 @@ def _abx_fwd(
     xb_1 = xb_rope_1.to(tl.float16)
 
     # GEMV
-    a_0 = tl.load(A_ptrs)
-    a_1 = tl.load(A_ptrs + BLOCK_SIZE_D * stride_ad)
+    mask_a0 = offs_ds[None, :] < D
+    mask_a1 = (offs_ds + BLOCK_SIZE_D)[None, :] < D
+    a_0 = tl.load(A_ptrs, mask=mask_a0, other=0.0)
+    a_1 = tl.load(A_ptrs + BLOCK_SIZE_D * stride_ad, mask=mask_a1, other=0.0)
     abx_0 = tl.sum(a_0 * xb_0, 1)
     abx_1 = tl.sum(a_1 * xb_1, 1)
     abx = abx_0 + abx_1
-    tl.store(O_ptrs, abx[None, :])
+    mask_o = offs_ls[None, :] < seq_len
+    tl.store(O_ptrs, abx[None, :], mask=mask_o)
 
     
 def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, *, theta: float = 10000.0) -> torch.Tensor:
