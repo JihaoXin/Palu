@@ -90,6 +90,9 @@ def get_whiten_scale_matrix(model, tokenizer, args, dev):
         def __init__(self, module):
             super().__init__()
             self.module = module
+            # Newer Qwen2/Llama modeling indexes causal_mask_mapping[decoder_layer.attention_type]
+            # for every layer (incl. this wrapped layer-0), so the Catcher must expose it.
+            self.attention_type = getattr(module, "attention_type", "full_attention")
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
